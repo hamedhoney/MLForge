@@ -1,24 +1,43 @@
-"""Load and validate the customer churn dataset."""
-
 from pathlib import Path
 
+import kagglehub
 import pandas as pd
 
-DATA_PATH = Path("data/WA_Fn-UseC_-Telco-Customer-Churn.csv")
+DATASET_HANDLE = "blastchar/telco-customer-churn"
+DATASET_FILENAME = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
 
 TARGET = "Churn"
 ID_COLUMN = "customerID"
 
 
-def load_dataset(path: Path = DATA_PATH) -> tuple[pd.DataFrame, pd.Series]:
-    """Load and validate the IBM Telco Churn dataset."""
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset not found: {path}")
+def download_dataset() -> Path:
+    """Download the dataset to the cloud runner's KaggleHub cache."""
+    dataset_dir = Path(kagglehub.dataset_download(DATASET_HANDLE))
 
-    df = pd.read_csv(path)
+    csv_path = dataset_dir / DATASET_FILENAME
+
+    if not csv_path.is_file():
+        matches = list(dataset_dir.rglob(DATASET_FILENAME))
+
+        if not matches:
+            raise FileNotFoundError(f"Expected {DATASET_FILENAME} in {dataset_dir}")
+
+        csv_path = matches[0]
+
+    print(f"Dataset downloaded: {csv_path}", flush=True)
+
+    return csv_path
+
+
+def load_dataset() -> tuple[pd.DataFrame, pd.Series]:
+    """Download, validate, and prepare the churn dataset."""
+    csv_path = download_dataset()
+
+    df = pd.read_csv(csv_path)
 
     required = {TARGET, ID_COLUMN, "TotalCharges"}
     missing = required - set(df.columns)
+
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
@@ -31,9 +50,18 @@ def load_dataset(path: Path = DATA_PATH) -> tuple[pd.DataFrame, pd.Series]:
     if df[TARGET].isna().any() or not df[TARGET].isin(["Yes", "No"]).all():
         raise ValueError("Churn must contain only Yes/No values")
 
-    df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df["TotalCharges"] = pd.to_numeric(
+        df["TotalCharges"],
+        errors="coerce",
+    )
 
     y = df[TARGET].map({"No": 0, "Yes": 1}).astype(int)
+
     X = df.drop(columns=[TARGET, ID_COLUMN])
+
+    print(
+        f"Dataset loaded: {len(X)} rows, {X.shape[1]} features",
+        flush=True,
+    )
 
     return X, y
