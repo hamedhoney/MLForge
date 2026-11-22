@@ -55,7 +55,9 @@ def main() -> None:
         ),
     }
 
-    mlflow.set_tracking_uri((output_dir / "mlruns").resolve().as_uri())
+    tracking_db = output_dir / "mlflow.db"
+
+    mlflow.set_tracking_uri(f"sqlite:///{tracking_db.resolve().as_posix()}")
     mlflow.set_experiment("mlforge-baseline")
 
     results = {}
