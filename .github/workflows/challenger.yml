@@ -1,0 +1,49 @@
+name: MLForge - Challenger Evaluation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  challenger:
+    name: Train and Compare Models
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check code quality
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+
+      - name: Run unit tests
+        run: uv run --locked pytest -q
+
+      - name: Train and compare models
+        run: |
+          uv run --locked python -m mlforge.models.challenger
+
+      - name: Upload comparison results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlforge-challenger-results
+          path: artifacts/challenger/
+          retention-days: 30
+          if-no-files-found: warn
