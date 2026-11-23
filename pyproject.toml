@@ -18,6 +18,7 @@ dependencies = [
     "matplotlib>=3.9,<4",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
+    "streamlit>=1.40,<2",
 ]
 
 [dependency-groups]
