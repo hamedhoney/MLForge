@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+__pycache__
+.pytest_cache
+.ruff_cache
+data/
+tests/
+docs/
+artifacts/*
+!artifacts/tuning/
+artifacts/tuning/*
+!artifacts/tuning/best_model.joblib
+!artifacts/tuning/metadata.json
+.env
+.env.*
