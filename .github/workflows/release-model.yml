@@ -25,6 +25,9 @@ jobs:
     name: Verify provenance and publish release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -156,6 +159,16 @@ jobs:
           print('Manifest generated and source files verified')
           PY
           (cd release && sha256sum -c SHA256SUMS.txt)
+
+      - name: Check release token permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "Repository: $GH_REPO"
+          echo "Event: $GITHUB_EVENT_NAME"
+          echo "Token permissions requested: contents=write, actions=read"
+          gh api "repos/$GH_REPO" --jq '.full_name'
 
       - name: Publish immutable model release
         env:
