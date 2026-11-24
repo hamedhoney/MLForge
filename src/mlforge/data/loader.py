@@ -1,7 +1,10 @@
+import os
 from pathlib import Path
 
 import kagglehub
 import pandas as pd
+
+from mlforge.data.provenance import sha256_file
 
 DATASET_HANDLE = "blastchar/telco-customer-churn"
 DATASET_FILENAME = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
@@ -11,20 +14,53 @@ ID_COLUMN = "customerID"
 
 
 def download_dataset() -> Path:
-    """Download the dataset to the cloud runner's KaggleHub cache."""
+    """Download and verify the dataset using KaggleHub."""
     dataset_dir = Path(kagglehub.dataset_download(DATASET_HANDLE))
 
     csv_path = dataset_dir / DATASET_FILENAME
 
     if not csv_path.is_file():
-        matches = list(dataset_dir.rglob(DATASET_FILENAME))
+        matches = sorted(dataset_dir.rglob(DATASET_FILENAME))
 
         if not matches:
             raise FileNotFoundError(f"Expected {DATASET_FILENAME} in {dataset_dir}")
 
         csv_path = matches[0]
 
-    print(f"Dataset downloaded: {csv_path}", flush=True)
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        raise ValueError(f"Dataset file is missing or empty: {csv_path}")
+
+    # Verify dataset integrity when a checksum is configured.
+    expected_hash = os.getenv("MLFORGE_DATASET_SHA256")
+
+    if expected_hash:
+        expected_hash = expected_hash.strip().lower()
+
+        if len(expected_hash) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_hash
+        ):
+            raise ValueError(
+                "MLFORGE_DATASET_SHA256 must be a "
+                "64-character hexadecimal SHA-256 digest"
+            )
+
+        actual_hash = sha256_file(csv_path)
+
+        if actual_hash.lower() != expected_hash:
+            raise ValueError(
+                "Dataset checksum mismatch. "
+                f"Expected {expected_hash}, got {actual_hash}"
+            )
+
+        print(
+            "Dataset SHA-256 verification passed.",
+            flush=True,
+        )
+
+    print(
+        f"Dataset downloaded: {csv_path}",
+        flush=True,
+    )
 
     return csv_path
 
@@ -35,7 +71,12 @@ def load_dataset() -> tuple[pd.DataFrame, pd.Series]:
 
     df = pd.read_csv(csv_path)
 
-    required = {TARGET, ID_COLUMN, "TotalCharges"}
+    required = {
+        TARGET,
+        ID_COLUMN,
+        "TotalCharges",
+    }
+
     missing = required - set(df.columns)
 
     if missing:
