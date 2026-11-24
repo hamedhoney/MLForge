@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from urllib.request import urlopen
@@ -8,6 +9,9 @@ import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT / "src"))
 
 from mlforge.deployment import download_model
 
