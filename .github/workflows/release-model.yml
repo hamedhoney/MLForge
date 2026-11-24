@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       training_run_id:
-        description: "Trusted successful optimization workflow run ID"
+        description: "Successful trusted Cloud Training workflow run ID"
         required: true
         type: string
       version:
-        description: "New immutable model release version (e.g. v0.2.0)"
+        description: "New immutable model version (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -16,23 +16,56 @@ permissions:
   contents: write
   actions: read
 
+concurrency:
+  group: mlforge-model-release
+  cancel-in-progress: false
+
 jobs:
   publish:
+    name: Verify provenance and publish release
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Verify training run
+
+      - name: Verify requested version and training run
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.training_run_id }}
+          VERSION: ${{ inputs.version }}
         run: |
-          test "$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion')" = "success"
-          test "$(gh run view "$RUN_ID" --json headBranch --jq '.headBranch')" = "main"
-          test "$(gh run view "$RUN_ID" --json workflowName --jq '.workflowName')" = "MLForge - Cloud Training"
-      - name: Download approved model
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run ID"; exit 1; }
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Version must look like v0.2.0"; exit 1; }
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; refusing overwrite"
+            exit 1
+          fi
+          gh run view "$RUN_ID" --json conclusion,headBranch,workflowName,headSha,event \
+            > "$RUNNER_TEMP/training_run.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = json.loads((Path(os.environ['RUNNER_TEMP']) / 'training_run.json').read_text())
+          expected = {
+              'conclusion': 'success',
+              'headBranch': 'main',
+              'workflowName': 'MLForge - Cloud Training',
+              'event': 'workflow_dispatch',
+          }
+          for key, value in expected.items():
+              if info.get(key) != value:
+                  raise SystemExit(f"Unexpected training run {key}: {info.get(key)!r}")
+          sha = info.get('headSha', '')
+          if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha.lower()):
+              raise SystemExit('Invalid training commit SHA')
+          print('Verified training commit:', sha)
+          PY
+
+      - name: Download candidate model and provenance
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -42,26 +75,102 @@ jobs:
           gh run download "$RUN_ID" \
             --name mlforge-optimization-results \
             --dir release
-          test -s release/best_model.joblib
-          test -s release/metadata.json
-      - name: Generate checksums
+          for file in best_model.joblib metadata.json metrics.json provenance.json; do
+            test -s "release/$file" || { echo "Missing $file"; exit 1; }
+          done
+
+      - name: Generate and verify model manifest
+        env:
+          VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ inputs.training_run_id }}
         run: |
-          cd release
-          sha256sum best_model.joblib metadata.json > SHA256SUMS.txt
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path('release')
+          run_info = json.loads((Path(os.environ['RUNNER_TEMP']) / 'training_run.json').read_text())
+          provenance = json.loads((directory / 'provenance.json').read_text())
+          metadata = json.loads((directory / 'metadata.json').read_text())
+          metrics = json.loads((directory / 'metrics.json').read_text())
+
+          def digest(filename):
+              h = hashlib.sha256()
+              with (directory / filename).open('rb') as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          commit = run_info['headSha']
+          if provenance.get('git_commit') != commit:
+              raise SystemExit('Provenance commit does not match the training workflow')
+          dataset_hash = provenance.get('dataset_sha256', '')
+          if not isinstance(dataset_hash, str) or len(dataset_hash) != 64 or any(c not in '0123456789abcdef' for c in dataset_hash.lower()):
+              raise SystemExit('Invalid dataset SHA-256 in provenance')
+          if metadata.get('dataset_sha256') != dataset_hash:
+              raise SystemExit('Dataset fingerprint differs between metadata and provenance')
+          if metadata.get('git_commit') != commit:
+              raise SystemExit('Training commit differs between metadata and provenance')
+          if metadata.get('model') != metrics.get('model', metadata.get('model')):
+              raise SystemExit('Model name mismatch')
+          if not 0 <= float(metadata['threshold']) <= 1:
+              raise SystemExit('Invalid classification threshold')
+          if abs(float(metadata['threshold']) - float(metrics['threshold'])) > 1e-10:
+              raise SystemExit('Threshold differs between metadata and metrics')
+
+          files = ['best_model.joblib', 'metadata.json', 'metrics.json', 'provenance.json']
+          manifest = {
+              'schema_version': '1.0',
+              'release_version': os.environ['VERSION'],
+              'training_run_id': os.environ['RUN_ID'],
+              'training_git_commit': commit,
+              'dataset': {
+                  'filename': provenance.get('dataset_filename'),
+                  'sha256': dataset_hash,
+                  'size_bytes': provenance.get('dataset_size_bytes'),
+              },
+              'model': {
+                  'algorithm': metadata['model'],
+                  'threshold': float(metadata['threshold']),
+                  'features': metadata['features'],
+                  'best_params': metadata.get('best_params'),
+              },
+              'evaluation': {
+                  key: metrics[key] for key in ('roc_auc', 'pr_auc', 'recall', 'f1', 'accuracy', 'precision') if key in metrics
+              },
+              'environment': {
+                  'python': provenance.get('python_version'),
+                  'packages': provenance.get('packages', {}),
+              },
+              'file_sha256': {filename: digest(filename) for filename in files},
+          }
+          (directory / 'model_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          with (directory / 'SHA256SUMS.txt').open('w') as output:
+              for filename in [*files, 'model_manifest.json']:
+                  output.write(f'{digest(filename)}  {filename}\n')
+          for filename, expected in manifest['file_sha256'].items():
+              if digest(filename) != expected:
+                  raise SystemExit(f'Checksum verification failed for {filename}')
+          print('Manifest generated and source files verified')
+          PY
+          (cd release && sha256sum -c SHA256SUMS.txt)
+
       - name: Publish immutable model release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
+          RUN_ID: ${{ inputs.training_run_id }}
         run: |
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists; refusing overwrite"
-            exit 1
-          fi
           gh release create "$VERSION" \
             release/best_model.joblib \
             release/metadata.json \
+            release/metrics.json \
+            release/provenance.json \
+            release/model_manifest.json \
             release/SHA256SUMS.txt \
-            --target "$GITHUB_SHA" \
+            --target "$(python -c 'import json,os,pathlib; print(json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"training_run.json").read_text())["headSha"])')" \
             --title "MLForge Model $VERSION" \
-            --notes "Cloud-trained model from reviewed GitHub Actions run."
+            --notes "Verified model artifact and provenance from GitHub Actions training run $RUN_ID. Manual publication; quality-gate approval must be reviewed separately."
