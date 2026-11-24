@@ -12,48 +12,51 @@ permissions:
   contents: read
   actions: read
 
+env:
+  MLFORGE_DATASET_SHA256: "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a"
+
 jobs:
   evaluate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-
       - name: Install dependencies
         run: uv sync --locked
-
       - name: Run tests
         run: |
           uv run --locked ruff check .
           uv run --locked ruff format --check .
           uv run --locked pytest -q
-
       - name: Download champion
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p artifacts/champion
-
           gh release download v0.1.0 \
             --dir artifacts/champion \
             --pattern "best_model.joblib" \
             --pattern "metadata.json" \
             --pattern "SHA256SUMS.txt"
-
           cd artifacts/champion
           sha256sum -c SHA256SUMS.txt
-
+      - name: Verify candidate run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          test "$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion')" = "success"
+          test "$(gh run view "$RUN_ID" --json headBranch --jq '.headBranch')" = "main"
+          test "$(gh run view "$RUN_ID" --json workflowName --jq '.workflowName')" = "MLForge - Cloud Training"
       - name: Download candidate
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,18 +64,13 @@ jobs:
           RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
           mkdir -p artifacts/candidate
-
           gh run download "$RUN_ID" \
             --name mlforge-optimization-results \
             --dir artifacts/candidate
-
           test -s artifacts/candidate/best_model.joblib
           test -s artifacts/candidate/metadata.json
-
       - name: Compare models
-        run: |
-          uv run --locked python -m mlforge.models.compare
-
+        run: uv run --locked python -m mlforge.models.compare
       - name: Upload quality report
         if: always()
         uses: actions/upload-artifact@v4

@@ -6,41 +6,39 @@ on:
 permissions:
   contents: write
 
+env:
+  MLFORGE_DATASET_SHA256: "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a"
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-
       - name: Install dependencies
         run: uv sync --locked
-
       - name: Check code quality
         run: |
           uv run --locked ruff check .
           uv run --locked ruff format --check .
-
+      - name: Run monitoring tests
+        run: uv run --locked pytest tests/test_monitoring.py -q
       - name: Run monitoring
         run: uv run --locked python -m mlforge.monitoring.run
-
       - name: Upload monitoring artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mlforge-monitoring-report
           path: artifacts/monitoring/
           retention-days: 30
-
+          if-no-files-found: error
       - name: Publish latest monitoring report
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,8 +46,7 @@ jobs:
         run: |
           if gh release view monitoring-latest >/dev/null 2>&1; then
             gh release upload monitoring-latest \
-              artifacts/monitoring/drift_report.json \
-              --clobber
+              artifacts/monitoring/drift_report.json --clobber
           else
             gh release create monitoring-latest \
               artifacts/monitoring/drift_report.json \

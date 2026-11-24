@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       training_run_id:
-        description: "Successful optimization workflow run ID"
+        description: "Trusted successful optimization workflow run ID"
         required: true
         type: string
       version:
-        description: "Model version, e.g. v0.1.0"
+        description: "New immutable model release version (e.g. v0.2.0)"
         required: true
         type: string
 
@@ -20,11 +20,18 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
+      - name: Verify training run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.training_run_id }}
+        run: |
+          test "$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion')" = "success"
+          test "$(gh run view "$RUN_ID" --json headBranch --jq '.headBranch')" = "main"
+          test "$(gh run view "$RUN_ID" --json workflowName --jq '.workflowName')" = "MLForge - Cloud Training"
       - name: Download approved model
         env:
           GH_TOKEN: ${{ github.token }}
@@ -32,30 +39,29 @@ jobs:
           RUN_ID: ${{ inputs.training_run_id }}
         run: |
           mkdir -p release
-
           gh run download "$RUN_ID" \
             --name mlforge-optimization-results \
             --dir release
-
           test -s release/best_model.joblib
           test -s release/metadata.json
-
-      - name: Create checksums
+      - name: Generate checksums
         run: |
           cd release
-          sha256sum best_model.joblib metadata.json \
-            > SHA256SUMS.txt
-
-      - name: Publish GitHub Release
+          sha256sum best_model.joblib metadata.json > SHA256SUMS.txt
+      - name: Publish immutable model release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
         run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; refusing overwrite"
+            exit 1
+          fi
           gh release create "$VERSION" \
             release/best_model.joblib \
             release/metadata.json \
             release/SHA256SUMS.txt \
             --target "$GITHUB_SHA" \
             --title "MLForge Model $VERSION" \
-            --notes "Cloud-trained churn prediction model."
+            --notes "Cloud-trained model from reviewed GitHub Actions run."

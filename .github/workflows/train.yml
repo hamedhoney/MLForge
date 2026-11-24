@@ -6,49 +6,38 @@ on:
 permissions:
   contents: read
 
+env:
+  MLFORGE_DATASET_SHA256: "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a"
+
 jobs:
   train:
     name: Train and Evaluate Models
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-
       - name: Install dependencies
         run: uv sync --locked
-
       - name: Check code quality
         run: |
           uv run --locked ruff check .
           uv run --locked ruff format --check .
-
       - name: Run unit tests
         run: uv run --locked pytest -q
-
       - name: Download and validate dataset
         run: |
-          uv run --locked python -c "
-          from mlforge.data.loader import load_dataset
-          X, y = load_dataset()
-          print(f'Dataset ready: {X.shape}')
-          print(f'Target distribution: {y.value_counts().to_dict()}')
-          "
-
+          uv run --locked python -c "from mlforge.data.loader import load_dataset; X, y = load_dataset(); print('Dataset ready:', X.shape, 'Target distribution:', y.value_counts().to_dict())"
       - name: Train and evaluate models
         run: uv run --locked python -m mlforge.train
-
       - name: Upload training artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -57,31 +46,26 @@ jobs:
           path: artifacts/
           retention-days: 14
           if-no-files-found: warn
+
   optimize:
     name: Optimize and Explain Model
     runs-on: ubuntu-latest
     timeout-minutes: 45
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-
       - name: Install dependencies
         run: uv sync --locked
-
       - name: Run optimization
         run: uv run --locked python -m mlforge.tune
-
       - name: Upload optimization artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -90,4 +74,3 @@ jobs:
           path: artifacts/tuning/
           retention-days: 14
           if-no-files-found: warn
-
