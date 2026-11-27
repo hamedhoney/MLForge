@@ -364,19 +364,28 @@ jobs:
             exit 1
           fi
 
-          EXISTING_SHA=$(gh api "repos/$GH_REPO/git/ref/tags/$VERSION" \
-            --jq '.object.sha' 2>/dev/null || true)
+          # Resolve remote lightweight and annotated tags without FETCH_HEAD.
+          TAG_REF="refs/tags/$VERSION"
+          TAG_INFO=$(git ls-remote origin "$TAG_REF" "$TAG_REF^{}")
+          EXISTING_REF=$(printf '%s\n' "$TAG_INFO" | awk -v ref="$TAG_REF" '$2 == ref {print $1}')
+          PEELED_COMMIT=$(printf '%s\n' "$TAG_INFO" | awk -v ref="$TAG_REF^{}" '$2 == ref {print $1}')
 
-          if [ -n "$EXISTING_SHA" ]; then
-            if [ "$EXISTING_SHA" != "$TRAINING_SHA" ]; then
+          if [ -n "$EXISTING_REF" ]; then
+            # Annotated tags have a separate tag-object SHA. The ^{} ref
+            # is the actual commit, which must match the training SHA.
+            TAG_COMMIT="${PEELED_COMMIT:-$EXISTING_REF}"
+            echo "Existing tag object: $EXISTING_REF"
+            echo "Resolved tag commit: $TAG_COMMIT"
+            echo "Expected training commit: $TRAINING_SHA"
+            if [ "$TAG_COMMIT" != "$TRAINING_SHA" ]; then
               echo "Existing tag points to another commit; refusing to move it"
               exit 1
             fi
-            echo "Verified existing tag points to the training commit"
+            echo "Existing tag matches the training commit"
           else
-            echo "Creating version tag separately..."
+            echo "Tag $VERSION does not exist; creating it..."
             gh api --method POST "repos/$GH_REPO/git/refs" \
-              -f "ref=refs/tags/$VERSION" \
+              -f "ref=$TAG_REF" \
               -f "sha=$TRAINING_SHA"
           fi
 
