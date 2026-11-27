@@ -43,14 +43,8 @@ jobs:
           uv run --locked ruff check .
           uv run --locked ruff format --check .
           
-      - name: Run API and telemetry tests
-        run: |
-          uv run --locked pytest tests/test_api.py -q
-          uv run --locked pytest tests/test_telemetry.py -q
-          uv run --locked pytest tests/test_api_telemetry.py -q
-          uv run --locked pytest tests/test_api_client.py -q
-          uv run --locked pytest tests/test_history_storage.py -q
-          uv run --locked pytest tests/test_history_client.py -q
+      - name: Run complete test suite
+        run: uv run --locked pytest -q
       
       - name: Test PostgreSQL-compatible telemetry storage
         run: | 

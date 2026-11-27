@@ -1,7 +1,7 @@
 
 [project]
 name = "mlforge"
-version = "0.2.0"
+version = "0.4.0"
 description = "End-to-end MLOps platform for automated machine learning"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
