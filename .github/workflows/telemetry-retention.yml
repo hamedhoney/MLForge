@@ -1,0 +1,67 @@
+name: MLForge - Telemetry Retention
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mlforge-telemetry-retention
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Delete expired inference telemetry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    environment: production
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Delete telemetry older than 90 days
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          uv run --locked python - <<'PY'
+          import os
+
+          from mlforge.monitoring.storage import TelemetryStore
+
+          url = os.environ["DATABASE_URL"]
+
+          if url.startswith("postgresql://"):
+              url = url.replace(
+                  "postgresql://",
+                  "postgresql+psycopg://",
+                  1,
+              )
+
+          store = TelemetryStore(url)
+
+          try:
+              deleted = store.delete_older_than(days=90)
+
+              print(
+                  f"Telemetry retention completed. "
+                  f"Deleted {deleted} expired records."
+              )
+          finally:
+              store.close()
+          PY

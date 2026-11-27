@@ -65,3 +65,36 @@ def test_retention(store):
 
     assert store.delete_older_than(days=90) == 0
     assert store.summary()["total_predictions"] == 1
+
+
+def test_expired_records_are_deleted(store):
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import insert
+
+    from mlforge.monitoring.storage import InferenceRecord
+
+    old_timestamp = datetime.now(UTC) - timedelta(days=120)
+
+    with store.engine.begin() as connection:
+        connection.execute(
+            insert(InferenceRecord).values(
+                timestamp=old_timestamp,
+                model_version="v0.3.1",
+                latency_ms=12.0,
+                probability=0.4,
+                prediction=0,
+            )
+        )
+
+    store.record(
+        model_version="v0.3.1",
+        latency_ms=15.0,
+        probability=0.8,
+        prediction=1,
+    )
+
+    deleted = store.delete_older_than(days=90)
+
+    assert deleted == 1
+    assert store.summary(days=30)["total_predictions"] == 1
