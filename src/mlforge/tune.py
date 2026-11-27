@@ -8,167 +8,131 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import mlflow
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     PrecisionRecallDisplay,
     RocCurveDisplay,
-    accuracy_score,
-    average_precision_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
+from mlforge.config import DEFAULT_CONFIG
 from mlforge.data.loader import download_dataset, load_dataset
 from mlforge.data.provenance import save_provenance
+from mlforge.evaluate import (
+    bootstrap_confidence_intervals,
+    evaluate_binary_classifier,
+)
 from mlforge.models.explain import generate_explanations
 from mlforge.models.optimization import optimize_models
 from mlforge.models.threshold import optimize_threshold
 
 OUTPUT_DIR = Path("artifacts/tuning")
-RANDOM_STATE = 2026
+RANDOM_STATE = DEFAULT_CONFIG.random_state
 N_TRIALS = 10
 
 
 def main() -> None:
-    """Run cloud-based model optimization and evaluation."""
+    """Run model optimization and calibrated evaluation."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # -----------------------------------------------------
-    # 1. Download dataset and record provenance
-    # -----------------------------------------------------
-
+    # 1. Dataset and provenance
     dataset_path = download_dataset()
-
     provenance = save_provenance(
         dataset_path,
         OUTPUT_DIR / "provenance.json",
     )
-
-    print(
-        f"Dataset SHA-256: {provenance['dataset_sha256']}",
-        flush=True,
-    )
-
-    print(
-        f"Training Git commit: {provenance['git_commit']}",
-        flush=True,
-    )
-
-    # -----------------------------------------------------
-    # 2. Load and validate dataset
-    # -----------------------------------------------------
 
     X, y = load_dataset()
 
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
-        test_size=0.2,
+        test_size=DEFAULT_CONFIG.test_size,
         stratify=y,
         random_state=RANDOM_STATE,
     )
 
-    # -----------------------------------------------------
-    # 3. Configure MLflow
-    # -----------------------------------------------------
-
+    # 2. Configure MLflow
     tracking_db = (OUTPUT_DIR / "mlflow.db").resolve()
-
     mlflow.set_tracking_uri(f"sqlite:///{tracking_db.as_posix()}")
-
     mlflow.set_experiment("mlforge-optimization")
 
-    # -----------------------------------------------------
-    # 4. Hyperparameter optimization
-    # -----------------------------------------------------
-
+    # 3. Optuna optimization on training data
     model, study = optimize_models(
         X_train,
         y_train,
         n_trials=N_TRIALS,
     )
 
-    # -----------------------------------------------------
-    # 5. Optimize decision threshold
-    # -----------------------------------------------------
+    # 4. Calibrate model probabilities
+    calibration_cv = StratifiedKFold(
+        n_splits=DEFAULT_CONFIG.cv_folds,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
 
+    calibrated_model = CalibratedClassifierCV(
+        estimator=model,
+        method="sigmoid",
+        cv=calibration_cv,
+    )
+
+    # 5. Optimize threshold using OOF calibrated probabilities
     threshold_result = optimize_threshold(
-        model,
+        calibrated_model,
         X_train,
         y_train,
     )
-
     threshold = threshold_result["threshold"]
 
-    # -----------------------------------------------------
-    # 6. Fit final model
-    # -----------------------------------------------------
+    # 6. Fit final calibrated model
+    calibrated_model.fit(X_train, y_train)
 
-    model.fit(X_train, y_train)
-
-    # -----------------------------------------------------
-    # 7. Evaluate on held-out test data
-    # -----------------------------------------------------
-
-    probabilities = model.predict_proba(X_test)[:, 1]
-
+    # 7. Evaluate held-out data
+    probabilities = calibrated_model.predict_proba(X_test)[:, 1]
     predictions = (probabilities >= threshold).astype(int)
 
-    metrics = {
-        "accuracy": float(accuracy_score(y_test, predictions)),
-        "precision": float(
-            precision_score(
-                y_test,
-                predictions,
-                zero_division=0,
-            )
-        ),
-        "recall": float(
-            recall_score(
-                y_test,
-                predictions,
-                zero_division=0,
-            )
-        ),
-        "f1": float(
-            f1_score(
-                y_test,
-                predictions,
-                zero_division=0,
-            )
-        ),
-        "roc_auc": float(roc_auc_score(y_test, probabilities)),
-        "pr_auc": float(
-            average_precision_score(
-                y_test,
-                probabilities,
-            )
-        ),
-        "threshold": float(threshold),
-        "cv_roc_auc": float(study.best_value),
-        "validation_f1": float(threshold_result["validation_f1"]),
-    }
+    metrics = evaluate_binary_classifier(
+        y_true=y_test,
+        probabilities=probabilities,
+        threshold=threshold,
+    )
 
-    # -----------------------------------------------------
+    metrics["cv_roc_auc"] = float(study.best_value)
+    metrics["validation_f1"] = float(threshold_result["validation_f1"])
+
+    confidence_intervals = bootstrap_confidence_intervals(
+        y_true=y_test,
+        probabilities=probabilities,
+        n_bootstrap=DEFAULT_CONFIG.bootstrap_samples,
+        confidence=DEFAULT_CONFIG.confidence_level,
+        random_state=RANDOM_STATE,
+    )
+
     # 8. Save experiment results
-    # -----------------------------------------------------
-
-    with mlflow.start_run(run_name="optimized-model"):
+    with mlflow.start_run(run_name="optimized-calibrated-model"):
         mlflow.log_params(study.best_params)
 
         mlflow.log_params(
             {
                 "random_state": RANDOM_STATE,
                 "n_trials": N_TRIALS,
+                "calibration_method": "sigmoid",
+                "calibration_folds": DEFAULT_CONFIG.cv_folds,
                 "train_samples": len(X_train),
                 "test_samples": len(X_test),
             }
         )
 
-        mlflow.log_metrics(metrics)
+        # MLflow accepts scalar numeric metrics.
+        mlflow.log_metrics(
+            {
+                key: value
+                for key, value in metrics.items()
+                if isinstance(value, (int, float)) and value is not None
+            }
+        )
 
         mlflow.set_tags(
             {
@@ -178,15 +142,17 @@ def main() -> None:
             }
         )
 
-        # Save trained preprocessing + classifier pipeline.
+        # Save calibrated model
         joblib.dump(
-            model,
+            calibrated_model,
             OUTPUT_DIR / "best_model.joblib",
         )
 
         metadata = {
             "model": study.best_params["model_name"],
-            "threshold": float(threshold),
+            "calibrated": True,
+            "calibration_method": "sigmoid",
+            "threshold": threshold,
             "best_params": study.best_params,
             "features": X.columns.tolist(),
             "train_samples": len(X_train),
@@ -206,21 +172,18 @@ def main() -> None:
             encoding="utf-8",
         )
 
-        # Save Optuna trial history.
+        (OUTPUT_DIR / "confidence_intervals.json").write_text(
+            json.dumps(confidence_intervals, indent=2),
+            encoding="utf-8",
+        )
+
         study.trials_dataframe().to_csv(
             OUTPUT_DIR / "optuna_trials.csv",
             index=False,
         )
 
-        # -------------------------------------------------
-        # 9. Generate evaluation plots
-        # -------------------------------------------------
-
-        RocCurveDisplay.from_predictions(
-            y_test,
-            probabilities,
-        )
-
+        # 9. Evaluation plots
+        RocCurveDisplay.from_predictions(y_test, probabilities)
         plt.savefig(
             OUTPUT_DIR / "roc_curve.png",
             dpi=150,
@@ -232,7 +195,6 @@ def main() -> None:
             y_test,
             probabilities,
         )
-
         plt.savefig(
             OUTPUT_DIR / "precision_recall.png",
             dpi=150,
@@ -244,7 +206,6 @@ def main() -> None:
             y_test,
             predictions,
         )
-
         plt.savefig(
             OUTPUT_DIR / "confusion_matrix.png",
             dpi=150,
@@ -252,23 +213,22 @@ def main() -> None:
         )
         plt.close()
 
-        # -------------------------------------------------
-        # 10. Generate SHAP explanations
-        # -------------------------------------------------
+        # 10. SHAP explanations
+        # Use the underlying fitted pipeline for compatibility
+        # with the existing explanation implementation.
+        fitted_model = calibrated_model.calibrated_classifiers_[0].estimator
 
         generate_explanations(
-            model,
+            fitted_model,
             X_test,
             OUTPUT_DIR,
         )
 
-        # -------------------------------------------------
-        # 11. Log experiment artifacts to MLflow
-        # -------------------------------------------------
-
+        # 11. Log artifacts
         artifact_files = [
             "metadata.json",
             "metrics.json",
+            "confidence_intervals.json",
             "provenance.json",
             "optuna_trials.csv",
             "roc_curve.png",
@@ -279,16 +239,11 @@ def main() -> None:
 
         for filename in artifact_files:
             path = OUTPUT_DIR / filename
-
             if path.is_file():
                 mlflow.log_artifact(
                     str(path),
                     artifact_path="evaluation",
                 )
-
-    # -----------------------------------------------------
-    # 12. Print final results
-    # -----------------------------------------------------
 
     print(
         json.dumps(
@@ -297,16 +252,14 @@ def main() -> None:
                 "dataset_sha256": provenance["dataset_sha256"],
                 "git_commit": provenance["git_commit"],
                 "metrics": metrics,
+                "confidence_intervals": confidence_intervals,
             },
             indent=2,
         ),
         flush=True,
     )
 
-    print(
-        "MLForge optimization and provenance tracking completed!",
-        flush=True,
-    )
+    print("MLForge calibrated optimization completed!", flush=True)
 
 
 if __name__ == "__main__":

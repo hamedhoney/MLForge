@@ -1,18 +1,17 @@
 import numpy as np
 from sklearn.base import clone
 from sklearn.metrics import f1_score
-from sklearn.model_selection import (
-    StratifiedKFold,
-    cross_val_predict,
-)
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+
+from mlforge.config import DEFAULT_CONFIG
 
 
 def optimize_threshold(model, X, y):
-    """Select threshold using out-of-fold predictions."""
+    """Select threshold without using held-out test data."""
     cv = StratifiedKFold(
-        n_splits=3,
+        n_splits=DEFAULT_CONFIG.cv_folds,
         shuffle=True,
-        random_state=123,
+        random_state=DEFAULT_CONFIG.random_state,
     )
 
     probabilities = cross_val_predict(
