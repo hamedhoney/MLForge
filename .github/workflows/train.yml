@@ -14,30 +14,39 @@ jobs:
     name: Train and Evaluate Models
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+
       - name: Install dependencies
         run: uv sync --locked
+
       - name: Check code quality
         run: |
-          uv run --locked ruff check .
-          uv run --locked ruff format --check .
+          uvx ruff check .
+          uvx ruff format --check .
+
       - name: Run unit tests
         run: uv run --locked pytest -q
+
       - name: Download and validate dataset
         run: |
           uv run --locked python -c "from mlforge.data.loader import load_dataset; X, y = load_dataset(); print('Dataset ready:', X.shape, 'Target distribution:', y.value_counts().to_dict())"
+
       - name: Train and evaluate models
         run: uv run --locked python -m mlforge.train
+
       - name: Upload training artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -48,24 +57,91 @@ jobs:
           if-no-files-found: warn
 
   optimize:
-    name: Optimize and Explain Model
+    name: Optimize and Explain Calibrated Model
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+
       - name: Install dependencies
         run: uv sync --locked
-      - name: Run optimization
+
+      - name: Check code quality
+        run: |
+          uvx ruff check .
+          uvx ruff format --check .
+
+      - name: Run evaluation and calibration tests
+        run: |
+          uv run --locked pytest tests/test_evaluation.py -q
+          uv run --locked pytest tests/test_calibration.py -q
+
+      - name: Run optimization and calibration
         run: uv run --locked python -m mlforge.tune
+
+      - name: Verify calibrated model artifacts
+        run: |
+          test -s artifacts/tuning/best_model.joblib
+          test -s artifacts/tuning/metadata.json
+          test -s artifacts/tuning/metrics.json
+          test -s artifacts/tuning/confidence_intervals.json
+          test -s artifacts/tuning/provenance.json
+          test -s artifacts/tuning/roc_curve.png
+          test -s artifacts/tuning/precision_recall.png
+          test -s artifacts/tuning/confusion_matrix.png
+
+          uv run --locked python - <<'PY'
+          import json
+          from pathlib import Path
+
+          import joblib
+          from sklearn.calibration import CalibratedClassifierCV
+
+          directory = Path("artifacts/tuning")
+
+          model = joblib.load(directory / "best_model.joblib")
+          metadata = json.loads(
+              (directory / "metadata.json").read_text()
+          )
+          metrics = json.loads(
+              (directory / "metrics.json").read_text()
+          )
+          intervals = json.loads(
+              (directory / "confidence_intervals.json").read_text()
+          )
+
+          assert isinstance(model, CalibratedClassifierCV)
+          assert metadata["calibrated"] is True
+          assert metadata["calibration_method"] == "sigmoid"
+          assert 0 <= metadata["threshold"] <= 1
+          assert abs(
+              metadata["threshold"] - metrics["threshold"]
+          ) < 1e-10
+
+          assert "brier_score" in metrics
+          assert "log_loss" in metrics
+          assert "roc_auc" in intervals
+          assert "pr_auc" in intervals
+
+          for metric_name in ("roc_auc", "pr_auc"):
+              interval = intervals[metric_name]
+              assert 0 <= interval["lower"] <= interval["upper"] <= 1
+
+          print("Calibrated model artifacts verified.")
+          PY
+
       - name: Upload optimization artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -73,4 +149,4 @@ jobs:
           name: mlforge-optimization-results
           path: artifacts/tuning/
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: error
