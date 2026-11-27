@@ -56,3 +56,20 @@ def get_summary(base_url: str, token: str, days: int = 30) -> dict:
     if not isinstance(result, dict):
         raise APIClientError("Invalid monitoring response")
     return result
+
+
+def get_history(
+    base_url: str, token: str, days: int = 30, model_version: str | None = None
+) -> dict:
+    """Retrieve aggregated historical monitoring points."""
+    if not token:
+        raise APIClientError("Monitoring token is required")
+    if not 1 <= days <= 365:
+        raise ValueError("days must be between 1 and 365")
+    params = {"days": days}
+    if model_version:
+        params["model_version"] = model_version
+    result = _request(base_url, "/monitoring/history?" + urlencode(params), token=token)
+    if not isinstance(result, dict) or not isinstance(result.get("points"), list):
+        raise APIClientError("Invalid monitoring history response")
+    return result

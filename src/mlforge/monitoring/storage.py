@@ -116,6 +116,75 @@ class TelemetryStore:
             ),
         }
 
+    def history(self, days: int = 30, model_version: str | None = None) -> dict:
+        """Aggregate observed predictions by UTC day (no individual events returned)."""
+        import math
+        from collections import defaultdict
+
+        if not 1 <= days <= 365:
+            raise ValueError("days must be between 1 and 365")
+        if model_version is not None and (not model_version or len(model_version) > 64):
+            raise ValueError("Invalid model version")
+
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        statement = select(
+            InferenceRecord.timestamp,
+            InferenceRecord.model_version,
+            InferenceRecord.latency_ms,
+            InferenceRecord.probability,
+            InferenceRecord.prediction,
+        ).where(InferenceRecord.timestamp >= cutoff)
+        if model_version is not None:
+            statement = statement.where(InferenceRecord.model_version == model_version)
+
+        buckets = defaultdict(
+            lambda: {
+                "latencies": [],
+                "probability_sum": 0.0,
+                "churn_sum": 0,
+                "count": 0,
+            }
+        )
+        versions = set()
+        with Session(self.engine) as session:
+            for timestamp, version, latency, probability, prediction in session.execute(
+                statement.order_by(InferenceRecord.timestamp)
+            ):
+                day = timestamp.date().isoformat()
+                bucket = buckets[day]
+                bucket["count"] += 1
+                bucket["latencies"].append(float(latency))
+                bucket["probability_sum"] += float(probability)
+                bucket["churn_sum"] += int(prediction)
+                versions.add(version)
+
+        points = []
+        for day, bucket in sorted(buckets.items()):
+            n = bucket["count"]
+            latencies = sorted(bucket["latencies"])
+            index = (n - 1) * 0.95
+            lower = math.floor(index)
+            upper = math.ceil(index)
+            p95 = latencies[lower] + (latencies[upper] - latencies[lower]) * (
+                index - lower
+            )
+            points.append(
+                {
+                    "date": day,
+                    "predictions": n,
+                    "mean_latency_ms": sum(latencies) / n,
+                    "p95_latency_ms": p95,
+                    "mean_probability": bucket["probability_sum"] / n,
+                    "predicted_churn_rate": bucket["churn_sum"] / n,
+                }
+            )
+        return {
+            "window_days": days,
+            "model_version": model_version,
+            "model_versions": sorted(versions),
+            "points": points,
+        }
+
     def delete_older_than(self, days: int = 90) -> int:
         """Delete expired telemetry records."""
         from sqlalchemy import delete

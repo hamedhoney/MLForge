@@ -8,6 +8,7 @@ import streamlit as st
 
 from api_client import (
     APIClientError,
+    get_history,
     get_model_info,
     get_summary,
     predict_customer,
@@ -421,6 +422,36 @@ with monitoring_tab:
                 st.json(summary)
         except APIClientError as exc:
             st.warning(f"Live telemetry unavailable: {exc}")
+
+    st.subheader("Observed telemetry trends")
+    version_filter = st.text_input(
+        "Model version filter (optional)", value="", placeholder="e.g. v0.3.1"
+    ).strip()
+    if MONITORING_TOKEN:
+        try:
+            history = get_history(
+                API_URL,
+                MONITORING_TOKEN,
+                days=days,
+                model_version=version_filter or None,
+            )
+            points = pd.DataFrame(history["points"])
+            if points.empty:
+                st.info("No recorded predictions for this window and model version.")
+            else:
+                points["date"] = pd.to_datetime(points["date"], utc=True)
+                points = points.set_index("date")
+                st.caption(
+                    "Daily UTC aggregates of observed API predictions; no customer profiles."
+                )
+                st.subheader("Prediction volume")
+                st.bar_chart(points[["predictions"]])
+                st.subheader("Inference latency (milliseconds)")
+                st.line_chart(points[["mean_latency_ms", "p95_latency_ms"]])
+                st.subheader("Prediction distribution")
+                st.line_chart(points[["mean_probability", "predicted_churn_rate"]])
+        except (APIClientError, KeyError, TypeError, ValueError) as exc:
+            st.warning(f"Historical charts unavailable: {exc}")
 
     st.divider()
     st.subheader("Simulated feature drift demonstration")
