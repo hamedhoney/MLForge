@@ -50,8 +50,9 @@ jobs:
           uv run --locked pytest tests/test_api_telemetry.py -q
       
       - name: Test PostgreSQL-compatible telemetry storage
-        run: uv run --locked pytest tests/test_telemetry_storage.py -q
-        run: uv run --locked pytest tests/test_neon_integration.py -q
+        run: | 
+          uv run --locked pytest tests/test_telemetry_storage.py -q
+          uv run --locked pytest tests/test_neon_integration.py -q
 
       - name: Download trained model from GitHub Actions
         env:
