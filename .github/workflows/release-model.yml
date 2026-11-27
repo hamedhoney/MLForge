@@ -56,11 +56,8 @@ jobs:
             exit 1
           fi
 
-          if gh api "repos/$GH_REPO/git/ref/tags/$VERSION" \
-            >/dev/null 2>&1; then
-            echo "Tag already exists"
-            exit 1
-          fi
+          # Existing tags are checked against the verified training SHA
+          # in the publication step, allowing safe retries.
 
           gh run view "$RUN_ID" \
             --json conclusion,headBranch,workflowName,headSha,event \
@@ -345,17 +342,45 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
           RUN_ID: ${{ inputs.training_run_id }}
+        shell: bash
         run: |
-          TRAINING_SHA=$(python - <<'PY'
+          set -euo pipefail
+
+          TRAINING_SHA=$(python - <<'PYCODE'
           import json
           import os
           from pathlib import Path
 
           path = Path(os.environ["RUNNER_TEMP"]) / "training_run.json"
           print(json.loads(path.read_text())["headSha"])
-          PY
+          PYCODE
           )
 
+          echo "Release version: $VERSION"
+          echo "Training commit: $TRAINING_SHA"
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release already exists; refusing to overwrite"
+            exit 1
+          fi
+
+          EXISTING_SHA=$(gh api "repos/$GH_REPO/git/ref/tags/$VERSION" \
+            --jq '.object.sha' 2>/dev/null || true)
+
+          if [ -n "$EXISTING_SHA" ]; then
+            if [ "$EXISTING_SHA" != "$TRAINING_SHA" ]; then
+              echo "Existing tag points to another commit; refusing to move it"
+              exit 1
+            fi
+            echo "Verified existing tag points to the training commit"
+          else
+            echo "Creating version tag separately..."
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f "ref=refs/tags/$VERSION" \
+              -f "sha=$TRAINING_SHA"
+          fi
+
+          echo "Publishing GitHub Release..."
           gh release create "$VERSION" \
             release/best_model.joblib \
             release/metadata.json \
@@ -364,8 +389,10 @@ jobs:
             release/confidence_intervals.json \
             release/model_manifest.json \
             release/SHA256SUMS.txt \
-            --target "$TRAINING_SHA" \
+            --verify-tag \
             --title "MLForge Model $VERSION" \
             --notes "Calibrated MLForge model from training run $RUN_ID. Includes evaluation metrics, bootstrap confidence intervals, provenance, and SHA-256 checksums. Quality-gate approval must be reviewed separately."
 
-          echo "Published MLForge model $VERSION"
+          gh release view "$VERSION" \
+            --json tagName,url,assets \
+            --jq '{tag: .tagName, url: .url, assets: [.assets[].name]}'
