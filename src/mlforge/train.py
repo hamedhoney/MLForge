@@ -1,5 +1,3 @@
-"""Train, evaluate, and track churn prediction models."""
-
 import json
 from pathlib import Path
 
@@ -20,29 +18,24 @@ from sklearn.model_selection import (
     cross_validate,
     train_test_split,
 )
-
+from mlforge.evaluate import evaluate_binary_classifier
 from mlforge.data.loader import load_dataset
 from mlforge.models.pipeline import build_models
+from mlforge.config import DEFAULT_CONFIG
 
-RANDOM_STATE = 42
+RANDOM_STATE = DEFAULT_CONFIG.random_state
 OUTPUT_DIR = Path("artifacts")
 
 
 def evaluate_model(model, X_test, y_test):
-    """Evaluate predictions on held-out test data."""
-    predictions = model.predict(X_test)
+    """Evaluate a fitted model using the shared evaluator."""
     probabilities = model.predict_proba(X_test)[:, 1]
 
-    return {
-        "accuracy": float(accuracy_score(y_test, predictions)),
-        "precision": float(precision_score(y_test, predictions, zero_division=0)),
-        "recall": float(recall_score(y_test, predictions, zero_division=0)),
-        "f1": float(f1_score(y_test, predictions, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_test, probabilities)),
-        "pr_auc": float(average_precision_score(y_test, probabilities)),
-        "confusion_matrix": confusion_matrix(y_test, predictions).tolist(),
-    }
-
+    return evaluate_binary_classifier(
+        y_true=y_test,
+        probabilities=probabilities,
+        threshold=0.5,
+    )
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,7 +45,7 @@ def main():
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
-        test_size=0.2,
+        test_size=DEFAULT_CONFIG.test_size,
         stratify=y,
         random_state=RANDOM_STATE,
     )
@@ -64,7 +57,7 @@ def main():
     models = build_models(X_train)
 
     cv = StratifiedKFold(
-        n_splits=5,
+        n_splits=DEFAULT_CONFIG.cv_folds,
         shuffle=True,
         random_state=RANDOM_STATE,
     )

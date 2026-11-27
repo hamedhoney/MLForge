@@ -1,6 +1,3 @@
-
-"""Reusable binary classification evaluation utilities."""
-
 from typing import Any
 
 import numpy as np
