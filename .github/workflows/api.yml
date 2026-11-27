@@ -42,9 +42,12 @@ jobs:
         run: |
           uv run --locked ruff check .
           uv run --locked ruff format --check .
-
-      - name: Run API tests
-        run: uv run --locked pytest tests/test_api.py -q
+          
+      - name: Run API and telemetry tests
+        run: |
+          uv run --locked pytest tests/test_api.py -q
+          uv run --locked pytest tests/test_telemetry.py -q
+          uv run --locked pytest tests/test_api_telemetry.py -q
 
       - name: Download trained model from GitHub Actions
         env:
