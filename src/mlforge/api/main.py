@@ -1,5 +1,3 @@
-"""FastAPI inference endpoints with bounded, process-local telemetry."""
-
 import os
 import secrets
 from contextlib import asynccontextmanager
