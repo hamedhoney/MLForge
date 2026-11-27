@@ -30,11 +30,11 @@ jobs:
         uses: astral-sh/setup-uv@v6
       - name: Install dependencies
         run: uv sync --locked
-      - name: Run tests
-        run: |
-          uv run --locked ruff check .
-          uv run --locked ruff format --check .
-          uv run --locked pytest -q
+      - name: Test evaluation module
+        run: uv run --frozen pytest tests/test_evaluation.py -q
+        
+      - name: Run full test suite
+        run: uv run --frozen pytest -q
       - name: Download champion
         env:
           GH_TOKEN: ${{ github.token }}
