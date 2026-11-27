@@ -3,43 +3,33 @@ from pathlib import Path
 
 import joblib
 from sklearn.base import clone
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.model_selection import (
     StratifiedKFold,
     cross_val_predict,
     train_test_split,
 )
 
+from mlforge.config import DEFAULT_CONFIG
 from mlforge.data.loader import load_dataset
+from mlforge.evaluate import evaluate_binary_classifier
 from mlforge.models.business import calculate_business_cost
 from mlforge.models.decision import select_threshold
 from mlforge.models.pipeline import build_models
 from mlforge.models.quality_gate import check_quality
 
 OUTPUT_DIR = Path("artifacts/challenger")
-RANDOM_STATE = 2027
+RANDOM_STATE = DEFAULT_CONFIG.random_state
 
 
 def evaluate(model, X, y, threshold):
     """Evaluate a fitted model on common test records."""
     probabilities = model.predict_proba(X)[:, 1]
-    predictions = (probabilities >= threshold).astype(int)
 
-    metrics = {
-        "accuracy": float(accuracy_score(y, predictions)),
-        "precision": float(precision_score(y, predictions, zero_division=0)),
-        "recall": float(recall_score(y, predictions, zero_division=0)),
-        "f1": float(f1_score(y, predictions, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y, probabilities)),
-        "pr_auc": float(average_precision_score(y, probabilities)),
-    }
+    metrics = evaluate_binary_classifier(
+        y_true=y,
+        probabilities=probabilities,
+        threshold=threshold,
+    )
 
     costs = calculate_business_cost(
         y,
