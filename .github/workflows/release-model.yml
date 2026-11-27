@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       version:
-        description: "New immutable model version (e.g. v0.2.0)"
+        description: "New immutable model version (e.g. v0.3.0)"
         required: true
         type: string
 
@@ -25,9 +25,11 @@ jobs:
     name: Verify provenance and publish release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     permissions:
       contents: write
       actions: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,33 +41,61 @@ jobs:
           RUN_ID: ${{ inputs.training_run_id }}
           VERSION: ${{ inputs.version }}
         run: |
-          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "Invalid run ID"; exit 1; }
-          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Version must look like v0.2.0"; exit 1; }
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "Invalid run ID"
+            exit 1
+          }
+
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid semantic version"
+            exit 1
+          }
+
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists; refusing overwrite"
+            echo "Release already exists"
             exit 1
           fi
-          gh run view "$RUN_ID" --json conclusion,headBranch,workflowName,headSha,event \
+
+          if gh api "repos/$GH_REPO/git/ref/tags/$VERSION" \
+            >/dev/null 2>&1; then
+            echo "Tag already exists"
+            exit 1
+          fi
+
+          gh run view "$RUN_ID" \
+            --json conclusion,headBranch,workflowName,headSha,event \
             > "$RUNNER_TEMP/training_run.json"
+
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          info = json.loads((Path(os.environ['RUNNER_TEMP']) / 'training_run.json').read_text())
+          path = Path(os.environ["RUNNER_TEMP"]) / "training_run.json"
+          info = json.loads(path.read_text())
+
           expected = {
-              'conclusion': 'success',
-              'headBranch': 'main',
-              'workflowName': 'MLForge - Cloud Training',
-              'event': 'workflow_dispatch',
+              "conclusion": "success",
+              "headBranch": "main",
+              "workflowName": "MLForge - Cloud Training",
+              "event": "workflow_dispatch",
           }
+
           for key, value in expected.items():
               if info.get(key) != value:
-                  raise SystemExit(f"Unexpected training run {key}: {info.get(key)!r}")
-          sha = info.get('headSha', '')
-          if len(sha) != 40 or any(c not in '0123456789abcdef' for c in sha.lower()):
-              raise SystemExit('Invalid training commit SHA')
-          print('Verified training commit:', sha)
+                  raise SystemExit(
+                      f"Unexpected training run {key}: {info.get(key)!r}"
+                  )
+
+          sha = info.get("headSha", "")
+
+          if (
+              len(sha) != 40
+              or any(c not in "0123456789abcdef" for c in sha.lower())
+          ):
+              raise SystemExit("Invalid training commit SHA")
+
+          print("Verified training commit:", sha)
           PY
 
       - name: Download candidate model and provenance
@@ -75,115 +105,255 @@ jobs:
           RUN_ID: ${{ inputs.training_run_id }}
         run: |
           mkdir -p release
+
           gh run download "$RUN_ID" \
             --name mlforge-optimization-results \
             --dir release
-          for file in best_model.joblib metadata.json metrics.json provenance.json; do
-            test -s "release/$file" || { echo "Missing $file"; exit 1; }
+
+          for file in \
+            best_model.joblib \
+            metadata.json \
+            metrics.json \
+            provenance.json \
+            confidence_intervals.json; do
+
+            test -s "release/$file" || {
+              echo "Missing artifact: $file"
+              exit 1
+            }
           done
 
-      - name: Generate and verify model manifest
+      - name: Verify calibrated model and generate manifest
         env:
           VERSION: ${{ inputs.version }}
           RUN_ID: ${{ inputs.training_run_id }}
+          EXPECTED_DATASET_SHA256: "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a"
         run: |
           python - <<'PY'
           import hashlib
           import json
+          import math
           import os
           from pathlib import Path
 
-          directory = Path('release')
-          run_info = json.loads((Path(os.environ['RUNNER_TEMP']) / 'training_run.json').read_text())
-          provenance = json.loads((directory / 'provenance.json').read_text())
-          metadata = json.loads((directory / 'metadata.json').read_text())
-          metrics = json.loads((directory / 'metrics.json').read_text())
+          directory = Path("release")
+
+          run_info = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "training_run.json")
+              .read_text()
+          )
+
+          provenance = json.loads(
+              (directory / "provenance.json").read_text()
+          )
+          metadata = json.loads(
+              (directory / "metadata.json").read_text()
+          )
+          metrics = json.loads(
+              (directory / "metrics.json").read_text()
+          )
+          intervals = json.loads(
+              (directory / "confidence_intervals.json").read_text()
+          )
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
 
           def digest(filename):
               h = hashlib.sha256()
-              with (directory / filename).open('rb') as source:
-                  for chunk in iter(lambda: source.read(1024 * 1024), b''):
+              with (directory / filename).open("rb") as source:
+                  for chunk in iter(
+                      lambda: source.read(1024 * 1024), b""
+                  ):
                       h.update(chunk)
               return h.hexdigest()
 
-          commit = run_info['headSha']
-          if provenance.get('git_commit') != commit:
-              raise SystemExit('Provenance commit does not match the training workflow')
-          dataset_hash = provenance.get('dataset_sha256', '')
-          if not isinstance(dataset_hash, str) or len(dataset_hash) != 64 or any(c not in '0123456789abcdef' for c in dataset_hash.lower()):
-              raise SystemExit('Invalid dataset SHA-256 in provenance')
-          if metadata.get('dataset_sha256') != dataset_hash:
-              raise SystemExit('Dataset fingerprint differs between metadata and provenance')
-          if metadata.get('git_commit') != commit:
-              raise SystemExit('Training commit differs between metadata and provenance')
-          if metadata.get('model') != metrics.get('model', metadata.get('model')):
-              raise SystemExit('Model name mismatch')
-          if not 0 <= float(metadata['threshold']) <= 1:
-              raise SystemExit('Invalid classification threshold')
-          if abs(float(metadata['threshold']) - float(metrics['threshold'])) > 1e-10:
-              raise SystemExit('Threshold differs between metadata and metrics')
+          commit = run_info["headSha"]
+          dataset_hash = provenance.get("dataset_sha256")
 
-          files = ['best_model.joblib', 'metadata.json', 'metrics.json', 'provenance.json']
+          require(
+              provenance.get("git_commit") == commit,
+              "Training provenance commit mismatch",
+          )
+          require(
+              metadata.get("git_commit") == commit,
+              "Metadata commit mismatch",
+          )
+          require(
+              dataset_hash == os.environ["EXPECTED_DATASET_SHA256"],
+              "Unexpected dataset fingerprint",
+          )
+          require(
+              metadata.get("dataset_sha256") == dataset_hash,
+              "Dataset fingerprint mismatch",
+          )
+          require(
+              metadata.get("calibrated") is True,
+              "Model is not marked as calibrated",
+          )
+          require(
+              metadata.get("calibration_method") == "sigmoid",
+              "Unexpected calibration method",
+          )
+
+          threshold = float(metadata["threshold"])
+          metric_threshold = float(metrics["threshold"])
+
+          require(
+              math.isfinite(threshold) and 0 <= threshold <= 1,
+              "Invalid threshold",
+          )
+          require(
+              math.isfinite(metric_threshold)
+              and abs(threshold - metric_threshold) < 1e-10,
+              "Threshold mismatch",
+          )
+
+          for name in ("roc_auc", "pr_auc"):
+              value = float(metrics[name])
+              require(
+                  math.isfinite(value) and 0 <= value <= 1,
+                  f"Invalid metric: {name}",
+              )
+
+              interval = intervals[name]
+              lower = float(interval["lower"])
+              upper = float(interval["upper"])
+
+              require(
+                  math.isfinite(lower)
+                  and math.isfinite(upper)
+                  and 0 <= lower <= upper <= 1,
+                  f"Invalid confidence interval: {name}",
+              )
+
+          for name in ("brier_score", "log_loss"):
+              value = float(metrics[name])
+              require(
+                  math.isfinite(value) and value >= 0,
+                  f"Invalid metric: {name}",
+              )
+
+          features = metadata["features"]
+          require(
+              isinstance(features, list)
+              and len(features) > 0
+              and len(features) == len(set(features))
+              and all(isinstance(f, str) for f in features),
+              "Invalid feature schema",
+          )
+
+          files = [
+              "best_model.joblib",
+              "metadata.json",
+              "metrics.json",
+              "provenance.json",
+              "confidence_intervals.json",
+          ]
+
           manifest = {
-              'schema_version': '1.0',
-              'release_version': os.environ['VERSION'],
-              'training_run_id': os.environ['RUN_ID'],
-              'training_git_commit': commit,
-              'dataset': {
-                  'filename': provenance.get('dataset_filename'),
-                  'sha256': dataset_hash,
-                  'size_bytes': provenance.get('dataset_size_bytes'),
+              "schema_version": "1.1",
+              "release_version": os.environ["VERSION"],
+              "training_run_id": os.environ["RUN_ID"],
+              "training_git_commit": commit,
+              "dataset": {
+                  "filename": provenance.get("dataset_filename"),
+                  "sha256": dataset_hash,
+                  "size_bytes": provenance.get("dataset_size_bytes"),
               },
-              'model': {
-                  'algorithm': metadata['model'],
-                  'threshold': float(metadata['threshold']),
-                  'features': metadata['features'],
-                  'best_params': metadata.get('best_params'),
+              "model": {
+                  "algorithm": metadata["model"],
+                  "threshold": threshold,
+                  "features": features,
+                  "best_params": metadata.get("best_params"),
+                  "calibrated": True,
+                  "calibration_method": "sigmoid",
               },
-              'evaluation': {
-                  key: metrics[key] for key in ('roc_auc', 'pr_auc', 'recall', 'f1', 'accuracy', 'precision') if key in metrics
+              "evaluation": {
+                  key: metrics[key]
+                  for key in (
+                      "roc_auc",
+                      "pr_auc",
+                      "recall",
+                      "f1",
+                      "accuracy",
+                      "precision",
+                      "brier_score",
+                      "log_loss",
+                  )
+                  if key in metrics
               },
-              'environment': {
-                  'python': provenance.get('python_version'),
-                  'packages': provenance.get('packages', {}),
+              "confidence_intervals": intervals,
+              "environment": {
+                  "python": provenance.get("python_version"),
+                  "packages": provenance.get("packages", {}),
               },
-              'file_sha256': {filename: digest(filename) for filename in files},
+              "file_sha256": {
+                  filename: digest(filename)
+                  for filename in files
+              },
           }
-          (directory / 'model_manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
-          with (directory / 'SHA256SUMS.txt').open('w') as output:
-              for filename in [*files, 'model_manifest.json']:
-                  output.write(f'{digest(filename)}  {filename}\n')
-          for filename, expected in manifest['file_sha256'].items():
-              if digest(filename) != expected:
-                  raise SystemExit(f'Checksum verification failed for {filename}')
-          print('Manifest generated and source files verified')
-          PY
-          (cd release && sha256sum -c SHA256SUMS.txt)
 
-      - name: Check release token permissions
+          (directory / "model_manifest.json").write_text(
+              json.dumps(manifest, indent=2) + "\n"
+          )
+
+          with (directory / "SHA256SUMS.txt").open("w") as output:
+              for filename in [*files, "model_manifest.json"]:
+                  output.write(
+                      f"{digest(filename)}  {filename}\n"
+                  )
+
+          for filename, expected in manifest["file_sha256"].items():
+              require(
+                  digest(filename) == expected,
+                  f"Checksum mismatch: {filename}",
+              )
+
+          print("Calibrated model manifest verified")
+          PY
+
+          (
+            cd release
+            sha256sum -c SHA256SUMS.txt
+          )
+
+      - name: Verify release permissions
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           echo "Repository: $GH_REPO"
-          echo "Event: $GITHUB_EVENT_NAME"
-          echo "Token permissions requested: contents=write, actions=read"
           gh api "repos/$GH_REPO" --jq '.full_name'
 
-      - name: Publish immutable model release
+      - name: Publish immutable calibrated model release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
           RUN_ID: ${{ inputs.training_run_id }}
         run: |
+          TRAINING_SHA=$(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "training_run.json"
+          print(json.loads(path.read_text())["headSha"])
+          PY
+          )
+
           gh release create "$VERSION" \
             release/best_model.joblib \
             release/metadata.json \
             release/metrics.json \
             release/provenance.json \
+            release/confidence_intervals.json \
             release/model_manifest.json \
             release/SHA256SUMS.txt \
-            --target "$(python -c 'import json,os,pathlib; print(json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"training_run.json").read_text())["headSha"])')" \
+            --target "$TRAINING_SHA" \
             --title "MLForge Model $VERSION" \
-            --notes "Verified model artifact and provenance from GitHub Actions training run $RUN_ID. Manual publication; quality-gate approval must be reviewed separately."
+            --notes "Calibrated MLForge model from training run $RUN_ID. Includes evaluation metrics, bootstrap confidence intervals, provenance, and SHA-256 checksums. Quality-gate approval must be reviewed separately."
+
+          echo "Published MLForge model $VERSION"
