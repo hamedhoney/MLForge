@@ -1,21 +1,20 @@
 import json
 import os
-import sys
-import time
-from pathlib import Path
 from urllib.request import urlopen
 
-import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
+from mlforge.api_client import (
+    APIClientError,
+    get_model_info,
+    get_summary,
+    predict_customer,
+)
 
-from mlforge.deployment import download_model  # noqa: E402
-
-MODEL_DIR = Path(os.getenv("MLFORGE_MODEL_DIR", "artifacts/tuning"))
+API_URL = st.secrets.get("API_URL", os.getenv("API_URL", "")).rstrip("/")
+MONITORING_TOKEN = st.secrets.get("MONITORING_TOKEN", os.getenv("MONITORING_TOKEN", ""))
 
 MONITORING_URL = (
     "https://github.com/hamedhoney/MLForge/"
@@ -31,28 +30,15 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------
-# Model loading
+# Model information from the deployed inference API
 # ---------------------------------------------------------
 
 
-@st.cache_resource
-def load_model():
-    """Load the trusted model and its metadata."""
-    model_path = MODEL_DIR / "best_model.joblib"
-    metadata_path = MODEL_DIR / "metadata.json"
-
-    if not model_path.exists() or not metadata_path.exists():
-        download_model()
-
-    # Only load artifacts from the verified GitHub release.
-    model = joblib.load(model_path)
-
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-
-    return model, metadata
+@st.cache_data(ttl=120)
+def load_model_info():
+    return get_model_info(API_URL)
 
 
-# ---------------------------------------------------------
 # Monitoring report loading
 # ---------------------------------------------------------
 
@@ -72,20 +58,24 @@ def load_monitoring_report():
 st.title("MLForge")
 st.caption("End-to-End MLOps Platform | Customer Churn Prediction & Monitoring")
 
-try:
-    model, metadata = load_model()
-except (OSError, ValueError, KeyError) as exc:
-    st.error(f"Unable to load model: {exc}")
+if not API_URL:
+    st.error("Configure API_URL in Streamlit Secrets.")
     st.stop()
 
-threshold = float(metadata["threshold"])
+try:
+    info = load_model_info()
+except APIClientError as exc:
+    st.error(f"Inference API unavailable: {exc}")
+    st.stop()
+
+threshold = float(info["threshold"])
+model_version = info.get("model_version") or "unknown"
 
 st.sidebar.header("Model Information")
-
-st.sidebar.write(f"**Model:** {metadata['model']}")
+st.sidebar.write(f"**Model:** {info['model_name']}")
 st.sidebar.write(f"**Decision threshold:** {threshold:.2f}")
-st.sidebar.write(f"**Input features:** {len(metadata['features'])}")
-st.sidebar.write("**Model version:** v0.1.0")
+st.sidebar.write(f"**Input features:** {info['feature_count']}")
+st.sidebar.write(f"**Model version:** {model_version}")
 
 st.sidebar.divider()
 
@@ -313,20 +303,12 @@ with prediction_tab:
             "TotalCharges": total,
         }
 
-        frame = pd.DataFrame([customer])
-
-        frame = frame.reindex(columns=metadata["features"])
-
         try:
-            start_time = time.perf_counter()
-
-            probability = float(model.predict_proba(frame)[0, 1])
-
-            latency_ms = (time.perf_counter() - start_time) * 1000
-
-            prediction = int(probability >= threshold)
-
-        except (ValueError, TypeError, KeyError) as exc:
+            result, latency_ms = predict_customer(API_URL, customer)
+            probability = float(result["churn_probability"])
+            prediction = int(result["prediction"])
+            threshold = float(result["threshold"])
+        except (APIClientError, ValueError, KeyError, TypeError) as exc:
             st.error(f"Prediction failed: {exc}")
             st.stop()
 
@@ -369,14 +351,14 @@ with prediction_tab:
 
         latency_col2.metric(
             "Model Version",
-            "v0.1.0",
+            model_version,
         )
 
         with st.expander("View prediction details"):
             st.json(
                 {
-                    "model": metadata["model"],
-                    "model_version": "v0.1.0",
+                    "model": result["model_name"],
+                    "model_version": model_version,
                     "prediction": prediction,
                     "churn_probability": probability,
                     "threshold": threshold,
@@ -401,7 +383,47 @@ with prediction_tab:
 
 with monitoring_tab:
     st.header("Model Monitoring")
+    st.subheader("Observed inference telemetry")
+    st.caption(
+        "Historical aggregates from the deployed API and Neon PostgreSQL; not ground-truth churn outcomes."
+    )
+    days = st.selectbox("Observation window", [7, 30, 90], index=1)
+    if st.button("Refresh live telemetry"):
+        st.rerun()
+    if not MONITORING_TOKEN:
+        st.warning("MONITORING_TOKEN is missing from Streamlit Secrets.")
+    else:
+        try:
+            summary = get_summary(API_URL, MONITORING_TOKEN, days=days)
+            source = summary.get("source", "unknown")
+            if source != "persistent_database":
+                st.warning(
+                    "Showing process-local fallback metrics; persistent storage is unavailable."
+                )
+            else:
+                st.success("Historical telemetry loaded from Neon PostgreSQL.")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Predictions", summary.get("total_predictions", 0))
+            latency = summary.get("mean_latency_ms")
+            m2.metric(
+                "Mean latency", f"{latency:.1f} ms" if latency is not None else "N/A"
+            )
+            probability = summary.get("mean_probability")
+            m3.metric(
+                "Mean churn probability",
+                f"{probability:.1%}" if probability is not None else "N/A",
+            )
+            churn = summary.get("predicted_churn_rate")
+            m4.metric(
+                "Predicted churn share", f"{churn:.1%}" if churn is not None else "N/A"
+            )
+            with st.expander("View telemetry summary"):
+                st.json(summary)
+        except APIClientError as exc:
+            st.warning(f"Live telemetry unavailable: {exc}")
 
+    st.divider()
+    st.subheader("Simulated feature drift demonstration")
     st.caption(
         "Statistical data drift detection using a "
         "reproducible simulated distribution shift. "

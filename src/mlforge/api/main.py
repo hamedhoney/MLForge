@@ -197,6 +197,7 @@ def model_info(request: Request):
 
     return {
         "model_name": service.model_name,
+        "model_version": get_model_version(service),
         "threshold": service.threshold,
         "features": service.features,
         "feature_count": len(service.features),
