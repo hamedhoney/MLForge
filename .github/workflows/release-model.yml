@@ -326,7 +326,7 @@ jobs:
         run: |
           echo "Repository: $GH_REPO"
           gh api "repos/$GH_REPO" --jq '.full_name'
-          
+
       - name: Diagnose GitHub token permissions
         env:
           GH_TOKEN: ${{ github.token }}
@@ -344,7 +344,7 @@ jobs:
 
       - name: Publish immutable calibrated model release
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.MLFORGE_RELEASE_TOKEN }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
           RUN_ID: ${{ inputs.training_run_id }}
