@@ -1,5 +1,3 @@
-"""HTTP client for the deployed MLForge inference API."""
-
 import json
 import time
 from urllib.error import HTTPError, URLError

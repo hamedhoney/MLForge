@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from mlforge.api_client import (
+from api_client import (
     APIClientError,
     get_model_info,
     get_summary,

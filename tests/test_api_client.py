@@ -4,7 +4,7 @@ from urllib.error import HTTPError
 
 import pytest
 
-from mlforge import api_client
+import api_client
 
 
 class FakeResponse:
