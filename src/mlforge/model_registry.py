@@ -12,6 +12,7 @@ REQUIRED_ASSETS = {
     "SHA256SUMS.txt",
 }
 
+
 def get_latest_model_version() -> str:
     """Return the newest stable release with required model assets."""
     pinned = os.getenv("MLFORGE_MODEL_VERSION")
@@ -25,10 +26,7 @@ def get_latest_model_version() -> str:
     page = 1
 
     while True:
-        url = (
-            f"https://api.github.com/repos/{REPO}/releases"
-            f"?per_page=100&page={page}"
-        )
+        url = f"https://api.github.com/repos/{REPO}/releases?per_page=100&page={page}"
 
         request = Request(
             url,
@@ -62,17 +60,12 @@ def get_latest_model_version() -> str:
         if release.get("draft") or release.get("prerelease"):
             continue
 
-        assets = {
-            asset["name"]
-            for asset in release.get("assets", [])
-        }
+        assets = {asset["name"] for asset in release.get("assets", [])}
 
         if not REQUIRED_ASSETS.issubset(assets):
             continue
 
-        version_tuple = tuple(
-            int(part) for part in version[1:].split(".")
-        )
+        version_tuple = tuple(int(part) for part in version[1:].split("."))
 
         candidates.append((version_tuple, version))
 
