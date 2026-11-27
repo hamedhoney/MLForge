@@ -364,24 +364,19 @@ jobs:
             exit 1
           fi
 
-          # Query the exact tag ref; do not treat API error output as a SHA.
-          TAG_REF="refs/tags/$VERSION"
-          EXISTING_REF=$(git ls-remote --refs origin "$TAG_REF" | awk -v ref="$TAG_REF" '$2 == ref {print $1}')
+          EXISTING_SHA=$(gh api "repos/$GH_REPO/git/ref/tags/$VERSION" \
+            --jq '.object.sha' 2>/dev/null || true)
 
-          if [ -n "$EXISTING_REF" ]; then
-            echo "Existing tag found; resolving its target commit..."
-            git fetch --no-tags origin "$TAG_REF"
-            TAG_COMMIT=$(git rev-parse 'FETCH_HEAD^{commit}')
-            echo "Existing tag commit: $TAG_COMMIT"
-            if [ "$TAG_COMMIT" != "$TRAINING_SHA" ]; then
+          if [ -n "$EXISTING_SHA" ]; then
+            if [ "$EXISTING_SHA" != "$TRAINING_SHA" ]; then
               echo "Existing tag points to another commit; refusing to move it"
               exit 1
             fi
-            echo "Existing tag matches the training commit"
+            echo "Verified existing tag points to the training commit"
           else
-            echo "Tag $VERSION does not exist; creating it..."
+            echo "Creating version tag separately..."
             gh api --method POST "repos/$GH_REPO/git/refs" \
-              -f "ref=$TAG_REF" \
+              -f "ref=refs/tags/$VERSION" \
               -f "sha=$TRAINING_SHA"
           fi
 
