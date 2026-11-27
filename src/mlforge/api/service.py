@@ -12,9 +12,7 @@ from mlforge.deployment import download_model
 
 logger = logging.getLogger(__name__)
 
-MODEL_DIR = Path(
-    os.getenv("MLFORGE_MODEL_DIR", "artifacts/tuning")
-)
+MODEL_DIR = Path(os.getenv("MLFORGE_MODEL_DIR", "artifacts/tuning"))
 
 
 class ModelService:
@@ -28,16 +26,12 @@ class ModelService:
 
         # Download the model when artifacts are missing.
         if not model_path.is_file() or not metadata_path.is_file():
-            logger.info(
-                "Model artifacts missing. Downloading verified release."
-            )
+            logger.info("Model artifacts missing. Downloading verified release.")
 
             # The downloader uses MLFORGE_MODEL_DIR.
             # Ensure a custom directory stays consistent.
             if model_dir != MODEL_DIR:
-                raise ValueError(
-                    "Custom model directory requires preloaded artifacts"
-                )
+                raise ValueError("Custom model directory requires preloaded artifacts")
 
             version = download_model()
 
@@ -47,14 +41,10 @@ class ModelService:
             )
 
         if not model_path.is_file():
-            raise FileNotFoundError(
-                f"Model artifact missing: {model_path}"
-            )
+            raise FileNotFoundError(f"Model artifact missing: {model_path}")
 
         if not metadata_path.is_file():
-            raise FileNotFoundError(
-                f"Model metadata missing: {metadata_path}"
-            )
+            raise FileNotFoundError(f"Model metadata missing: {metadata_path}")
 
         logger.info("Loading model from %s", model_path)
 
@@ -62,9 +52,7 @@ class ModelService:
         # joblib deserialization can execute arbitrary code.
         self.model = joblib.load(model_path)
 
-        self.metadata = json.loads(
-            metadata_path.read_text(encoding="utf-8")
-        )
+        self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 
         self.threshold = float(self.metadata["threshold"])
         self.model_name = self.metadata["model"]
@@ -74,9 +62,7 @@ class ModelService:
             raise ValueError("Invalid model threshold")
 
         if not hasattr(self.model, "predict_proba"):
-            raise TypeError(
-                "Loaded model does not support predict_proba"
-            )
+            raise TypeError("Loaded model does not support predict_proba")
 
         version_path = model_dir / "version.txt"
 
@@ -100,17 +86,12 @@ class ModelService:
         if not customers:
             return []
 
-        records = [
-            customer.model_dump()
-            for customer in customers
-        ]
+        records = [customer.model_dump() for customer in customers]
 
         frame = pd.DataFrame(records)
         frame = frame.reindex(columns=self.features)
 
-        probabilities = np.asarray(
-            self.model.predict_proba(frame)[:, 1]
-        )
+        probabilities = np.asarray(self.model.predict_proba(frame)[:, 1])
 
         results = []
 
@@ -123,9 +104,7 @@ class ModelService:
             if not 0 <= probability <= 1:
                 raise ValueError("Model returned an invalid probability")
 
-            prediction = int(
-                probability >= self.threshold
-            )
+            prediction = int(probability >= self.threshold)
 
             if probability >= 0.7:
                 risk = "high"
