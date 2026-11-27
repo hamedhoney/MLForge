@@ -1,10 +1,23 @@
+import importlib.util
 import io
 import json
+from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
 
-import api_client
+MODULE_PATH = Path(__file__).resolve().parents[1] / "api_client.py"
+
+spec = importlib.util.spec_from_file_location(
+    "api_client",
+    MODULE_PATH,
+)
+
+if spec is None or spec.loader is None:
+    raise ImportError(f"Cannot load {MODULE_PATH}")
+
+api_client = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api_client)
 
 
 class FakeResponse:
