@@ -326,6 +326,21 @@ jobs:
         run: |
           echo "Repository: $GH_REPO"
           gh api "repos/$GH_REPO" --jq '.full_name'
+          
+      - name: Diagnose GitHub token permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "Checking effective token permissions"
+
+          gh api -i "repos/$GH_REPO" \
+            | grep -i "x-accepted-github-permissions" || true
+
+          echo "Checking repository access"
+
+          gh api "repos/$GH_REPO" \
+            --jq '{full_name, permissions, archived, disabled}'
 
       - name: Publish immutable calibrated model release
         env:
