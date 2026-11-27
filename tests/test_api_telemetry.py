@@ -1,5 +1,3 @@
-"""Integration tests for API inference telemetry without a real model artifact."""
-
 import pytest
 from fastapi.testclient import TestClient
 

@@ -1,7 +1,15 @@
+import importlib
+import pytest
+from pathlib import Path
+
 import pytest
 
-import api_client
+MODULE_PATH = Path(__file__).resolve().parents[1] / "api_client.py"
 
+spec = importlib.util.spec_from_file_location(
+    "api_client",
+    MODULE_PATH,
+)
 
 def test_history_query(monkeypatch):
     captured = {}
