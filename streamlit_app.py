@@ -13,7 +13,7 @@ import streamlit as st
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from mlforge.deployment import download_model
+from mlforge.deployment import download_model  # noqa: E402
 
 MODEL_DIR = Path(os.getenv("MLFORGE_MODEL_DIR", "artifacts/tuning"))
 

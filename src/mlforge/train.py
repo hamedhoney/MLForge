@@ -4,24 +4,16 @@ from pathlib import Path
 import joblib
 import mlflow
 import numpy as np
-from sklearn.metrics import (
-    accuracy_score,
-    average_precision_score,
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.model_selection import (
     StratifiedKFold,
     cross_validate,
     train_test_split,
 )
-from mlforge.evaluate import evaluate_binary_classifier
-from mlforge.data.loader import load_dataset
-from mlforge.models.pipeline import build_models
+
 from mlforge.config import DEFAULT_CONFIG
+from mlforge.data.loader import load_dataset
+from mlforge.evaluate import evaluate_binary_classifier
+from mlforge.models.pipeline import build_models
 
 RANDOM_STATE = DEFAULT_CONFIG.random_state
 OUTPUT_DIR = Path("artifacts")
@@ -36,6 +28,7 @@ def evaluate_model(model, X_test, y_test):
         probabilities=probabilities,
         threshold=0.5,
     )
+
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

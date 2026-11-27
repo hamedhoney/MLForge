@@ -44,22 +44,14 @@ def evaluate_binary_classifier(
 
     return {
         "accuracy": float(accuracy_score(y, predictions)),
-        "precision": float(
-            precision_score(y, predictions, zero_division=0)
-        ),
-        "recall": float(
-            recall_score(y, predictions, zero_division=0)
-        ),
+        "precision": float(precision_score(y, predictions, zero_division=0)),
+        "recall": float(recall_score(y, predictions, zero_division=0)),
         "f1": float(f1_score(y, predictions, zero_division=0)),
-        "roc_auc": (
-            float(roc_auc_score(y, p)) if has_both_classes else None
-        ),
+        "roc_auc": (float(roc_auc_score(y, p)) if has_both_classes else None),
         "pr_auc": float(average_precision_score(y, p)),
         "brier_score": float(brier_score_loss(y, p)),
         "log_loss": float(log_loss(y, p, labels=[0, 1])),
-        "confusion_matrix": confusion_matrix(
-            y, predictions, labels=[0, 1]
-        ).tolist(),
+        "confusion_matrix": confusion_matrix(y, predictions, labels=[0, 1]).tolist(),
         "threshold": float(threshold),
         "n_samples": int(len(y)),
     }
@@ -102,12 +94,8 @@ def bootstrap_confidence_intervals(
         if len(np.unique(sample_y)) < 2:
             continue
 
-        scores["roc_auc"].append(
-            float(roc_auc_score(sample_y, sample_p))
-        )
-        scores["pr_auc"].append(
-            float(average_precision_score(sample_y, sample_p))
-        )
+        scores["roc_auc"].append(float(roc_auc_score(sample_y, sample_p)))
+        scores["pr_auc"].append(float(average_precision_score(sample_y, sample_p)))
 
     alpha = (1 - confidence) / 2
 

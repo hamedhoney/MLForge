@@ -42,12 +42,8 @@ def test_single_class_auc_is_undefined():
 def test_bootstrap_reproducibility(predictions):
     y, p = predictions
 
-    first = bootstrap_confidence_intervals(
-        y, p, n_bootstrap=100, random_state=42
-    )
-    second = bootstrap_confidence_intervals(
-        y, p, n_bootstrap=100, random_state=42
-    )
+    first = bootstrap_confidence_intervals(y, p, n_bootstrap=100, random_state=42)
+    second = bootstrap_confidence_intervals(y, p, n_bootstrap=100, random_state=42)
 
     assert first == second
 
@@ -55,9 +51,7 @@ def test_bootstrap_reproducibility(predictions):
 def test_bootstrap_bounds(predictions):
     y, p = predictions
 
-    intervals = bootstrap_confidence_intervals(
-        y, p, n_bootstrap=100
-    )
+    intervals = bootstrap_confidence_intervals(y, p, n_bootstrap=100)
 
     for interval in intervals.values():
         assert 0 <= interval["lower"] <= interval["upper"] <= 1
