@@ -4,8 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       candidate_run_id:
-        description: "Trusted optimization run ID"
+        description: "Trusted Cloud Training workflow run ID"
         required: true
+        type: string
+      champion_version:
+        description: "Current production champion model version"
+        required: true
+        default: "v0.3.1"
         type: string
 
 permissions:
@@ -17,61 +22,210 @@ env:
 
 jobs:
   evaluate:
+    name: Evaluate Champion vs Challenger
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Set up Python
+
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
+
       - name: Install dependencies
         run: uv sync --locked
+
       - name: Test evaluation module
-        run: uv run --frozen pytest tests/test_evaluation.py -q
-        
+        run: uv run --locked pytest tests/test_evaluation.py -q
+
       - name: Run full test suite
-        run: uv run --frozen pytest -q
-      - name: Download champion
+        run: uv run --locked pytest -q
+
+      - name: Validate workflow inputs
+        env:
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          CHAMPION_VERSION: ${{ inputs.champion_version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid candidate training run ID"
+            exit 1
+          fi
+
+          if ! [[ "$CHAMPION_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid champion version"
+            exit 1
+          fi
+
+          echo "Candidate training run: $RUN_ID"
+          echo "Champion version: $CHAMPION_VERSION"
+
+      - name: Verify candidate training run
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
+          set -euo pipefail
+
+          gh run view "$RUN_ID" \
+            --repo "$GH_REPO" \
+            --json conclusion,headBranch,headSha,workflowName,event \
+            > "$RUNNER_TEMP/training_run.json"
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "training_run.json"
+          info = json.loads(path.read_text(encoding="utf-8"))
+
+          expected = {
+              "conclusion": "success",
+              "headBranch": "main",
+              "workflowName": "MLForge - Cloud Training",
+              "event": "workflow_dispatch",
+          }
+
+          for key, value in expected.items():
+              if info.get(key) != value:
+                  raise SystemExit(
+                      f"Invalid training run {key}: {info.get(key)!r}"
+                  )
+
+          commit = info.get("headSha", "")
+
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+              raise SystemExit("Invalid training commit SHA")
+
+          print(f"Verified training commit: {commit}")
+          PY
+
+      - name: Download champion model
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CHAMPION_VERSION: ${{ inputs.champion_version }}
+        run: |
+          set -euo pipefail
+
           mkdir -p artifacts/champion
-          gh release download v0.1.0 \
+
+          gh release download "$CHAMPION_VERSION" \
+            --repo "$GH_REPO" \
             --dir artifacts/champion \
             --pattern "best_model.joblib" \
             --pattern "metadata.json" \
             --pattern "SHA256SUMS.txt"
-          cd artifacts/champion
-          sha256sum -c SHA256SUMS.txt
-      - name: Verify candidate run
+
+          test -s artifacts/champion/best_model.joblib
+          test -s artifacts/champion/metadata.json
+          test -s artifacts/champion/SHA256SUMS.txt
+
+          (
+            cd artifacts/champion
+            sha256sum --check --ignore-missing SHA256SUMS.txt
+          )
+
+          echo "Champion model artifacts verified."
+
+      - name: Download candidate model
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.candidate_run_id }}
         run: |
-          test "$(gh run view "$RUN_ID" --json conclusion --jq '.conclusion')" = "success"
-          test "$(gh run view "$RUN_ID" --json headBranch --jq '.headBranch')" = "main"
-          test "$(gh run view "$RUN_ID" --json workflowName --jq '.workflowName')" = "MLForge - Cloud Training"
-      - name: Download candidate
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ inputs.candidate_run_id }}
-        run: |
+          set -euo pipefail
+
           mkdir -p artifacts/candidate
+
           gh run download "$RUN_ID" \
+            --repo "$GH_REPO" \
             --name mlforge-optimization-results \
             --dir artifacts/candidate
-          test -s artifacts/candidate/best_model.joblib
-          test -s artifacts/candidate/metadata.json
-      - name: Compare models
-        run: uv run --locked python -m mlforge.models.compare
-      - name: Upload quality report
+
+          for filename in \
+            best_model.joblib \
+            metadata.json \
+            metrics.json \
+            provenance.json
+          do
+            test -s "artifacts/candidate/$filename" || {
+              echo "::error::Missing candidate artifact: $filename"
+              exit 1
+            }
+          done
+
+          echo "Candidate model artifacts downloaded."
+
+      - name: Verify candidate provenance
+        env:
+          MLFORGE_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("artifacts/candidate")
+          run_info = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "training_run.json")
+              .read_text(encoding="utf-8")
+          )
+          metadata = json.loads(
+              (root / "metadata.json").read_text(encoding="utf-8")
+          )
+          provenance = json.loads(
+              (root / "provenance.json").read_text(encoding="utf-8")
+          )
+
+          expected_commit = run_info["headSha"]
+          expected_dataset = os.environ["MLFORGE_DATASET_SHA256"]
+
+          if metadata.get("git_commit") != expected_commit:
+              raise SystemExit("Candidate metadata commit mismatch")
+
+          if provenance.get("git_commit") != expected_commit:
+              raise SystemExit("Candidate provenance commit mismatch")
+
+          if provenance.get("dataset_sha256") != expected_dataset:
+              raise SystemExit("Unexpected candidate dataset fingerprint")
+
+          if metadata.get("dataset_sha256") != expected_dataset:
+              raise SystemExit("Candidate dataset fingerprint mismatch")
+
+          model_path = root / "best_model.joblib"
+          model_hash = hashlib.file_digest(
+              model_path.open("rb"), "sha256"
+          ).hexdigest()
+
+          print(f"Candidate model SHA-256: {model_hash}")
+          print(f"Training commit: {expected_commit}")
+          print(
+              "Training run:",
+              os.environ["MLFORGE_CANDIDATE_RUN_ID"],
+          )
+          PY
+
+      - name: Compare champion and challenger
+        run: |
+          set -euo pipefail
+
+          uv run --locked python -m mlforge.models.compare
+
+      - name: Upload quality-gate report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -79,3 +233,24 @@ jobs:
           path: artifacts/promotion/
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Summarize quality-gate execution
+        if: success()
+        env:
+          CHAMPION_VERSION: ${{ inputs.champion_version }}
+          RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          {
+            echo "## MLForge Model Quality Gate"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Champion model | $CHAMPION_VERSION |"
+            echo "| Candidate training run | $RUN_ID |"
+            echo "| Training provenance | Verified |"
+            echo "| Champion checksums | Verified against release manifest |"
+            echo "| Comparison command | Completed successfully |"
+            echo ""
+            echo "Artifact-specific promotion evidence is not yet generated."
+            echo "No production deployment was performed."
+          } >> "$GITHUB_STEP_SUMMARY"
