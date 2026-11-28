@@ -8,6 +8,10 @@ from mlforge.registry.models import (
     RegisteredModel,
     RegistryBase,
 )
+from mlforge.registry.transitions import (
+    ModelStatus,
+    validate_transition,
+)
 
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -135,6 +139,63 @@ class ModelRegistry:
             }
             for row in rows
         ]
+
+    def transition(
+        self,
+        *,
+        model_id: int,
+        target: ModelStatus,
+        quality_gate_passed: bool = False,
+        approved_by: str | None = None,
+        deployment_verified: bool = False,
+        rollback_authorized: bool = False,
+    ) -> int:
+        """Validate and append a model lifecycle transition."""
+        target = ModelStatus(target)
+
+        with Session(self.engine) as session:
+            with session.begin():
+                model = session.get(
+                    RegisteredModel,
+                    model_id,
+                    with_for_update=True,
+                )
+
+                if model is None:
+                    raise ValueError("Unknown model ID")
+
+                latest = session.scalar(
+                    select(ModelDeployment)
+                    .where(ModelDeployment.model_id == model_id)
+                    .order_by(ModelDeployment.id.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+
+                if latest is None:
+                    if target != ModelStatus.CANDIDATE:
+                        raise ValueError("New models must begin as candidates")
+                else:
+                    validate_transition(
+                        ModelStatus(latest.status),
+                        target,
+                        quality_gate_passed=quality_gate_passed,
+                        approved_by=approved_by,
+                        deployment_verified=deployment_verified,
+                        rollback_authorized=rollback_authorized,
+                    )
+
+                event = ModelDeployment(
+                    model_id=model_id,
+                    status=target.value,
+                )
+
+                session.add(event)
+                session.flush()
+
+                event_id = event.id
+
+        return event_id
 
     def close(self) -> None:
         """Dispose database connections."""
