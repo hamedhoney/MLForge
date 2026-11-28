@@ -1,0 +1,46 @@
+
+name: MLForge - Test Tag Permissions
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Verify token permissions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY" \
+            --jq '{full_name, permissions}'
+
+      - name: Test Git tag creation
+        run: |
+          set -euo pipefail
+
+          TAG="mlforge-permission-test-${GITHUB_RUN_ID}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag "$TAG"
+
+          git push origin "refs/tags/$TAG"
+
+          echo "Git tag creation succeeded: $TAG"
+
+          # Clean up the temporary tag.
+          git push origin ":refs/tags/$TAG"
+
+          echo "Temporary tag removed."
