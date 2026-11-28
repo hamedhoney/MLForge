@@ -50,6 +50,9 @@ jobs:
         run: | 
           uv run --locked pytest tests/test_telemetry_storage.py -q
           uv run --locked pytest tests/test_neon_integration.py -q
+      
+      - name: Test model registry
+        run: uv run --locked pytest tests/test_model_registry.py -q
 
       - name: Download trained model from GitHub Actions
         env:
