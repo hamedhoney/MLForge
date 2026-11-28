@@ -1,0 +1,69 @@
+name: MLForge - Render Environment Diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Inspect Render environment response
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          service = os.environ["RENDER_SERVICE_ID"]
+          key = os.environ["RENDER_API_KEY"]
+
+          url = (
+              "https://api.render.com/v1/services/"
+              f"{service}/env-vars"
+          )
+
+          request = Request(
+              url,
+              headers={
+                  "Authorization": f"Bearer {key}",
+                  "Accept": "application/json",
+              },
+          )
+
+          with urlopen(request, timeout=30) as response:
+              data = json.load(response)
+
+          print("Response type:", type(data).__name__)
+
+          if isinstance(data, list):
+              print("Number of entries:", len(data))
+
+              for item in data:
+                  if not isinstance(item, dict):
+                      print("Entry type:", type(item).__name__)
+                      continue
+
+                  print("Entry keys:", sorted(item.keys()))
+
+                  env_var = item.get("envVar", item)
+
+                  if isinstance(env_var, dict):
+                      print(
+                          "Environment variable name:",
+                          env_var.get("key", "<unknown>"),
+                      )
+
+          elif isinstance(data, dict):
+              print("Top-level keys:", sorted(data.keys()))
+
+          else:
+              print("Unexpected response structure")
+          PY
