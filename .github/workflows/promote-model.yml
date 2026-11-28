@@ -4,14 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       model_version:
-        description: "Published model release to promote"
+        description: "Published model version to promote"
         required: true
-        default: "v0.4.3"
+        default: "v0.4.4"
         type: string
-      evidence_run_id:
-        description: "Successful Model Quality Gate run ID"
+      deploy:
+        description: "Deploy to Render after production approval"
         required: true
-        type: string
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -20,6 +21,9 @@ permissions:
 concurrency:
   group: mlforge-production-promotion
   cancel-in-progress: false
+
+env:
+  API_URL: https://mlforge-api-xhej.onrender.com
 
 jobs:
   validate:
@@ -32,17 +36,24 @@ jobs:
       champion: ${{ steps.verify.outputs.champion }}
 
     steps:
-      - name: Validate inputs
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate model version
         env:
           MODEL_VERSION: ${{ inputs.model_version }}
-          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
         run: |
           set -euo pipefail
 
-          [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$EVIDENCE_RUN_ID" =~ ^[0-9]+$ ]]
+          if ! [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid model version"
+            exit 1
+          fi
 
-      - name: Download published model evidence
+      - name: Download published release
         env:
           GH_TOKEN: ${{ github.token }}
           MODEL_VERSION: ${{ inputs.model_version }}
@@ -53,71 +64,94 @@ jobs:
 
           gh release download "$MODEL_VERSION" \
             --repo "$GITHUB_REPOSITORY" \
-            --dir release \
-            --pattern "best_model.joblib" \
-            --pattern "metadata.json" \
-            --pattern "model_manifest.json" \
-            --pattern "promotion_evidence.json" \
-            --pattern "quality_report.json" \
-            --pattern "SHA256SUMS.txt"
+            --dir release
 
           for file in \
             best_model.joblib \
             metadata.json \
-            model_manifest.json \
-            promotion_evidence.json \
+            metrics.json \
+            provenance.json \
+            confidence_intervals.json \
             quality_report.json \
+            promotion_evidence.json \
+            model_manifest.json \
             SHA256SUMS.txt
           do
-            test -s "release/$file"
+            test -s "release/$file" || {
+              echo "::error::Missing release file: $file"
+              exit 1
+            }
           done
 
           (
             cd release
-            sha256sum --check --ignore-missing SHA256SUMS.txt
+            sha256sum --check SHA256SUMS.txt
           )
 
-      - name: Verify evidence-producing workflow
+      - name: Verify original evaluation workflow
         env:
           GH_TOKEN: ${{ github.token }}
-          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
         run: |
           set -euo pipefail
 
-          gh run view "$EVIDENCE_RUN_ID" \
+          RUN_ID=$(jq -r \
+            '.quality_gate_run_id' \
+            release/model_manifest.json)
+
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::Invalid quality-gate run ID"
+            exit 1
+          }
+
+          gh run view "$RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --json conclusion,headSha,headBranch,event,workflowName \
-            > "$RUNNER_TEMP/evaluation-run.json"
+            > evaluation-run.json
 
-      - name: Inspect Render production model
+          mkdir -p original-evidence
+
+          gh run download "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name mlforge-quality-report \
+            --dir original-evidence
+
+          cmp \
+            release/promotion_evidence.json \
+            original-evidence/promotion_evidence.json
+
+          cmp \
+            release/quality_report.json \
+            original-evidence/quality_report.json
+
+      - name: Inspect current production model
         run: |
           set -euo pipefail
 
-          curl --fail-with-body --silent --show-error \
+          curl --fail --silent --show-error \
             --retry 3 \
             --max-time 90 \
-            "https://mlforge-api-xhej.onrender.com/health" \
+            "$API_URL/health" \
             -o health.json
 
-          curl --fail-with-body --silent --show-error \
+          curl --fail --silent --show-error \
             --retry 3 \
             --max-time 90 \
-            "https://mlforge-api-xhej.onrender.com/model/info" \
-            -o production-model.json
+            "$API_URL/model/info" \
+            -o production.json
 
-      - name: Validate candidate and champion
+      - name: Verify promotion eligibility
         id: verify
         env:
           MODEL_VERSION: ${{ inputs.model_version }}
-          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
         run: |
           python - <<'PY'
           import hashlib
           import json
           import os
+          import subprocess
           from pathlib import Path
 
-          def read(path):
+          def load(path):
               return json.loads(
                   Path(path).read_text(encoding="utf-8")
               )
@@ -126,25 +160,20 @@ jobs:
               if not condition:
                   raise SystemExit(message)
 
-          manifest = read("release/model_manifest.json")
-          evidence = read("release/promotion_evidence.json")
-          report = read("release/quality_report.json")
-          run = read(
-              Path(os.environ["RUNNER_TEMP"])
-              / "evaluation-run.json"
-          )
-          production = read("production-model.json")
-          health = read("health.json")
+          manifest = load("release/model_manifest.json")
+          evidence = load("release/promotion_evidence.json")
+          report = load("release/quality_report.json")
+          evaluation_run = load("evaluation-run.json")
+          production = load("production.json")
+          health = load("health.json")
 
           candidate = evidence["candidate"]
           champion = evidence["champion"]
           evaluation = evidence["evaluation"]
 
-          with Path(
-              "release/best_model.joblib"
-          ).open("rb") as source:
-              digest = hashlib.file_digest(
-                  source, "sha256"
+          with Path("release/best_model.joblib").open("rb") as file:
+              model_hash = hashlib.file_digest(
+                  file, "sha256"
               ).hexdigest()
 
           require(
@@ -153,54 +182,39 @@ jobs:
               "Release version mismatch",
           )
           require(
-              candidate["model_sha256"] == digest,
+              candidate["model_sha256"] == model_hash,
               "Candidate checksum mismatch",
           )
           require(
-              manifest["promotion"][
-                  "candidate_model_sha256"
-              ] == digest,
+              manifest["file_sha256"]["best_model.joblib"]
+              == model_hash,
               "Manifest checksum mismatch",
           )
           require(
+              manifest["promotion"]["candidate_model_sha256"]
+              == model_hash,
+              "Promotion checksum mismatch",
+          )
+          require(
+              manifest["promotion"]["quality_gate_passed"] is True,
+              "Quality gate not approved",
+          )
+          require(
               report["passed"] is True,
-              "Quality gate failed",
+              "Quality report failed",
           )
           require(
               evaluation["quality_gate_passed"] is True,
-              "Evidence gate failed",
+              "Promotion evidence failed",
           )
           require(
-              evaluation["run_id"]
-              == int(os.environ["EVIDENCE_RUN_ID"]),
-              "Evidence run ID mismatch",
-          )
-          require(
-              run["conclusion"] == "success",
-              "Evaluation run unsuccessful",
-          )
-          require(
-              run["workflowName"]
-              == "MLForge - Model Quality Gate",
-              "Unexpected evaluation workflow",
-          )
-          require(
-              run["headBranch"] == "main",
-              "Evaluation did not run on main",
-          )
-          require(
-              run["event"] == "workflow_dispatch",
-              "Unexpected evaluation trigger",
-          )
-          require(
-              run["headSha"]
-              == candidate["training_commit"],
-              "Evaluation commit mismatch",
-          )
-          require(
-              manifest["training_git_commit"]
-              == candidate["training_commit"],
-              "Release commit mismatch",
+              isinstance(evaluation["checks"], dict)
+              and bool(evaluation["checks"])
+              and all(
+                  value is True
+                  for value in evaluation["checks"].values()
+              ),
+              "One or more quality checks failed",
           )
           require(
               evaluation["checks"] == report["checks"],
@@ -217,9 +231,91 @@ jobs:
               "Champion metrics mismatch",
           )
           require(
-              health["model_loaded"] is True,
-              "Production model unavailable",
+              evaluation["paired_bootstrap_95ci"]
+              == report["paired_bootstrap_95ci"],
+              "Bootstrap evidence mismatch",
           )
+          require(
+              evaluation_run["conclusion"] == "success",
+              "Evaluation workflow failed",
+          )
+          require(
+              evaluation_run["workflowName"]
+              == "MLForge - Model Quality Gate",
+              "Unexpected evaluation workflow",
+          )
+          require(
+              evaluation_run["headBranch"] == "main",
+              "Evaluation did not run on main",
+          )
+          require(
+              evaluation_run["event"] == "workflow_dispatch",
+              "Unexpected evaluation trigger",
+          )
+          require(
+              evaluation["run_id"]
+              == int(manifest["quality_gate_run_id"]),
+              "Evaluation run mismatch",
+          )
+          require(
+              candidate["training_run_id"]
+              == int(manifest["training_run_id"]),
+              "Training run mismatch",
+          )
+          require(
+              candidate["training_commit"]
+              == manifest["training_git_commit"]
+              == evaluation_run["headSha"],
+              "Training and evaluation commit mismatch",
+          )
+          require(
+              manifest["promotion"]["champion_version"]
+              == champion["version"],
+              "Champion evidence mismatch",
+          )
+
+          refs = subprocess.check_output(
+              [
+                  "git",
+                  "ls-remote",
+                  "origin",
+                  f"refs/tags/{os.environ['MODEL_VERSION']}",
+                  f"refs/tags/{os.environ['MODEL_VERSION']}^{{}}",
+              ],
+              text=True,
+          ).splitlines()
+
+          parsed = {
+              ref: sha
+              for sha, ref in (
+                  line.split()
+                  for line in refs
+              )
+          }
+
+          tag_ref = (
+              f"refs/tags/{os.environ['MODEL_VERSION']}"
+          )
+
+          require(
+              tag_ref in parsed,
+              "Release tag does not exist",
+          )
+
+          require(
+              parsed.get(
+                  f"{tag_ref}^{{}}",
+                  parsed[tag_ref],
+              ) == candidate["training_commit"],
+              "Release tag commit mismatch",
+          )
+
+          require(
+              health["status"] == "ready"
+              and health["model_loaded"] is True,
+              "Production API not ready",
+          )
+
           require(
               production["model_version"]
               == champion["version"],
@@ -227,7 +323,8 @@ jobs:
           )
 
           with open(
-              os.environ["GITHUB_OUTPUT"], "a"
+              os.environ["GITHUB_OUTPUT"],
+              "a",
           ) as output:
               output.write(
                   f"candidate={os.environ['MODEL_VERSION']}\n"
@@ -236,15 +333,16 @@ jobs:
                   f"champion={champion['version']}\n"
               )
 
-          print("Candidate release verified")
-          print("Production champion:", champion["version"])
           print("Candidate:", os.environ["MODEL_VERSION"])
+          print("Champion:", champion["version"])
+          print("Promotion evidence verified")
           PY
 
       - name: Summarize validation
         env:
           CANDIDATE: ${{ steps.verify.outputs.candidate }}
           CHAMPION: ${{ steps.verify.outputs.champion }}
+          DEPLOY: ${{ inputs.deploy }}
         run: |
           {
             echo "## MLForge Promotion Validation"
@@ -253,25 +351,300 @@ jobs:
             echo "|---|---|"
             echo "| Candidate | $CANDIDATE |"
             echo "| Champion | $CHAMPION |"
-            echo "| Quality-gate evidence | Verified |"
-            echo "| Production model | Verified |"
-            echo "| Deployment performed | No |"
+            echo "| Release evidence | Verified |"
+            echo "| Production baseline | Verified |"
+            echo "| Deployment requested | $DEPLOY |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  approve:
-    name: Production approval checkpoint
+  promote:
+    name: Approved Render deployment
     needs: validate
+    if: ${{ inputs.deploy }}
     runs-on: ubuntu-latest
-    environment: production
-    timeout-minutes: 10
+    timeout-minutes: 40
+
+    environment:
+      name: production
+
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      CANDIDATE: ${{ needs.validate.outputs.candidate }}
+      CHAMPION: ${{ needs.validate.outputs.champion }}
 
     steps:
-      - name: Confirm approved promotion plan
+      - name: Validate Render credentials
+        run: |
+          set -euo pipefail
+
+          test -n "$RENDER_API_KEY"
+          [[ "$RENDER_SERVICE_ID" =~ ^srv- ]]
+
+      - name: Deploy and verify with rollback
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          key = os.environ["RENDER_API_KEY"]
+          service_id = os.environ["RENDER_SERVICE_ID"]
+          candidate = os.environ["CANDIDATE"]
+          champion = os.environ["CHAMPION"]
+          api_url = os.environ["API_URL"].rstrip("/")
+
+          render_url = (
+              f"https://api.render.com/v1/services/{service_id}"
+          )
+
+          def request(url, method="GET", data=None, auth=False):
+              headers = {
+                  "Accept": "application/json",
+              }
+
+              if auth:
+                  headers["Authorization"] = f"Bearer {key}"
+
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+
+              payload = (
+                  json.dumps(data).encode("utf-8")
+                  if data is not None
+                  else None
+              )
+
+              req = Request(
+                  url,
+                  data=payload,
+                  headers=headers,
+                  method=method,
+              )
+
+              with urlopen(req, timeout=60) as response:
+                  body = response.read()
+                  return json.loads(body) if body else {}
+
+          def model_version():
+              health = request(f"{api_url}/health")
+              info = request(f"{api_url}/model/info")
+
+              if (
+                  health.get("status") != "ready"
+                  or health.get("model_loaded") is not True
+              ):
+                  raise RuntimeError("API is not ready")
+
+              return info["model_version"]
+
+          def configured_version():
+              response = request(
+                  f"{render_url}/env-vars/MLFORGE_MODEL_VERSION",
+                  auth=True,
+              )
+              return response["envVar"]["value"]
+
+          def set_version(version):
+              request(
+                  f"{render_url}/env-vars/MLFORGE_MODEL_VERSION",
+                  method="PUT",
+                  data={"value": version},
+                  auth=True,
+              )
+
+          def trigger_deploy():
+              result = request(
+                  f"{render_url}/deploys",
+                  method="POST",
+                  data={"clearCache": "do_not_clear"},
+                  auth=True,
+              )
+
+              deploy_id = result.get("id")
+
+              if not deploy_id:
+                  raise RuntimeError(
+                      "Render did not return deployment ID"
+                  )
+
+              return deploy_id
+
+          def wait_for_deploy(deploy_id, timeout=900):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  deploy = request(
+                      f"{render_url}/deploys/{deploy_id}",
+                      auth=True,
+                  )
+
+                  status = deploy.get("status", "")
+                  print(
+                      "Render deployment status:",
+                      status,
+                      flush=True,
+                  )
+
+                  if status == "live":
+                      return
+
+                  if status in {
+                      "build_failed",
+                      "update_failed",
+                      "canceled",
+                      "deactivated",
+                  }:
+                      raise RuntimeError(
+                          f"Render deployment failed: {status}"
+                      )
+
+                  time.sleep(15)
+
+              raise TimeoutError(
+                  "Render deployment timed out"
+              )
+
+          def wait_for_model(version, timeout=180):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  try:
+                      actual = model_version()
+
+                      if actual == version:
+                          return
+
+                      print(
+                          f"Expected {version}, found {actual}",
+                          flush=True,
+                      )
+
+                  except (
+                      HTTPError,
+                      URLError,
+                      RuntimeError,
+                  ):
+                      print(
+                          "Waiting for API readiness",
+                          flush=True,
+                      )
+
+                  time.sleep(10)
+
+              raise TimeoutError(
+                  f"Model {version} was not verified"
+              )
+
+          current = configured_version()
+
+          if current != champion:
+              raise SystemExit(
+                  "Render configuration does not match "
+                  "evaluated champion"
+              )
+
+          if model_version() != champion:
+              raise SystemExit(
+                  "Running production model differs "
+                  "from evaluated champion"
+              )
+
+          print(
+              "Previous production model:",
+              champion,
+              flush=True,
+          )
+
+          print(
+              "Candidate model:",
+              candidate,
+              flush=True,
+          )
+
+          changed = False
+
+          try:
+              changed = True
+              set_version(candidate)
+
+              deploy_id = trigger_deploy()
+
+              print(
+                  "Candidate deployment ID:",
+                  deploy_id,
+                  flush=True,
+              )
+
+              wait_for_deploy(deploy_id)
+              wait_for_model(candidate)
+
+              print(
+                  "SUCCESS: production model verified:",
+                  candidate,
+                  flush=True,
+              )
+
+          except Exception as error:
+              print(
+                  "Promotion failed:",
+                  type(error).__name__,
+                  flush=True,
+              )
+
+              if changed:
+                  print(
+                      "Attempting rollback to",
+                      champion,
+                      flush=True,
+                  )
+
+                  try:
+                      set_version(champion)
+
+                      rollback_id = trigger_deploy()
+
+                      print(
+                          "Rollback deployment ID:",
+                          rollback_id,
+                          flush=True,
+                      )
+
+                      wait_for_deploy(rollback_id)
+                      wait_for_model(champion)
+
+                      print(
+                          "Rollback verified. Production:",
+                          champion,
+                          flush=True,
+                      )
+
+                  except Exception as rollback_error:
+                      raise SystemExit(
+                          "CRITICAL: promotion failed "
+                          "and rollback was not verified"
+                      ) from rollback_error
+
+              raise SystemExit(
+                  "Promotion failed; rollback attempted"
+              ) from error
+          PY
+
+      - name: Summarize successful deployment
+        if: success()
         env:
           CANDIDATE: ${{ needs.validate.outputs.candidate }}
           CHAMPION: ${{ needs.validate.outputs.champion }}
         run: |
-          echo "Production approval completed."
-          echo "Champion: $CHAMPION"
-          echo "Candidate: $CANDIDATE"
-          echo "No Render deployment performed."
+          {
+            echo "## MLForge Production Deployment"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Previous champion | $CHAMPION |"
+            echo "| Deployed candidate | $CANDIDATE |"
+            echo "| Render deployment | Successful |"
+            echo "| Production model | Verified |"
+            echo "| Rollback | Not required |"
+          } >> "$GITHUB_STEP_SUMMARY"
