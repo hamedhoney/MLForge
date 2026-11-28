@@ -1,69 +1,132 @@
-name: MLForge - Render Environment Diagnostic
+
+name: MLForge - Render Promotion Preflight
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_champion:
+        description: "Expected current production model"
+        required: true
+        default: "v0.3.1"
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  inspect:
+  preflight:
+    name: Verify Render configuration
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
-      - name: Inspect Render environment response
+      - name: Validate current production configuration
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          EXPECTED_CHAMPION: ${{ inputs.expected_champion }}
         run: |
           python - <<'PY'
           import json
           import os
+          import re
           from urllib.request import Request, urlopen
 
-          service = os.environ["RENDER_SERVICE_ID"]
           key = os.environ["RENDER_API_KEY"]
+          service = os.environ["RENDER_SERVICE_ID"]
+          expected = os.environ["EXPECTED_CHAMPION"]
 
-          url = (
-              "https://api.render.com/v1/services/"
-              f"{service}/env-vars"
+          if not re.fullmatch(r"v\d+\.\d+\.\d+", expected):
+              raise SystemExit("Invalid champion version")
+
+          if not service.startswith("srv-"):
+              raise SystemExit("Invalid Render service ID")
+
+          base = (
+              f"https://api.render.com/v1/services/{service}"
           )
 
-          request = Request(
-              url,
-              headers={
-                  "Authorization": f"Bearer {key}",
+          def get(url, authenticated=False):
+              headers = {
                   "Accept": "application/json",
-              },
+              }
+
+              if authenticated:
+                  headers["Authorization"] = f"Bearer {key}"
+
+              request = Request(url, headers=headers)
+
+              with urlopen(request, timeout=90) as response:
+                  return json.load(response)
+
+          entries = get(
+              f"{base}/env-vars",
+              authenticated=True,
           )
 
-          with urlopen(request, timeout=30) as response:
-              data = json.load(response)
+          if not isinstance(entries, list):
+              raise SystemExit(
+                  "Unexpected Render environment response"
+              )
 
-          print("Response type:", type(data).__name__)
+          matches = [
+              entry["envVar"]
+              for entry in entries
+              if isinstance(entry, dict)
+              and isinstance(entry.get("envVar"), dict)
+              and entry["envVar"].get("key")
+              == "MLFORGE_MODEL_VERSION"
+          ]
 
-          if isinstance(data, list):
-              print("Number of entries:", len(data))
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Expected exactly one model version variable"
+              )
 
-              for item in data:
-                  if not isinstance(item, dict):
-                      print("Entry type:", type(item).__name__)
-                      continue
+          configured = matches[0].get("value")
 
-                  print("Entry keys:", sorted(item.keys()))
+          if configured != expected:
+              raise SystemExit(
+                  "Configured production model differs "
+                  "from expected champion"
+              )
 
-                  env_var = item.get("envVar", item)
+          api = "https://mlforge-api-xhej.onrender.com"
 
-                  if isinstance(env_var, dict):
-                      print(
-                          "Environment variable name:",
-                          env_var.get("key", "<unknown>"),
-                      )
+          health = get(f"{api}/health")
+          model = get(f"{api}/model/info")
 
-          elif isinstance(data, dict):
-              print("Top-level keys:", sorted(data.keys()))
+          if health.get("status") != "ready":
+              raise SystemExit("Production API not ready")
 
-          else:
-              print("Unexpected response structure")
+          if health.get("model_loaded") is not True:
+              raise SystemExit("Production model not loaded")
+
+          if model.get("model_version") != expected:
+              raise SystemExit(
+                  "Running production model differs "
+                  "from expected champion"
+              )
+
+          print("Render API authentication: verified")
+          print("Configured model:", configured)
+          print("Running model:", model["model_version"])
+          print("Production preflight passed")
           PY
+
+      - name: Summarize preflight
+        if: success()
+        env:
+          CHAMPION: ${{ inputs.expected_champion }}
+        run: |
+          {
+            echo "## MLForge Render Promotion Preflight"
+            echo ""
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Render API access | Verified |"
+            echo "| Environment variable lookup | Verified |"
+            echo "| Configured model | $CHAMPION |"
+            echo "| Running model | $CHAMPION |"
+            echo "| Production changes | None |"
+          } >> "$GITHUB_STEP_SUMMARY"
