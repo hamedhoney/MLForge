@@ -75,7 +75,13 @@ class ModelDeployment(RegistryBase):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('candidate', 'approved', 'deployed', 'rolled_back')",
+            "status IN ("
+            "'candidate', "
+            "'evaluated', "
+            "'approved', "
+            "'deployed', "
+            "'rolled_back'"
+            ")",
             name="ck_model_deployment_status",
         ),
     )
