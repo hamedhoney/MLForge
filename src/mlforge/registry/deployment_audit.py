@@ -1,4 +1,3 @@
-
 """Concurrency-safe deployment lifecycle auditing."""
 
 import re
@@ -52,9 +51,7 @@ TRANSITIONS = {
     "rollback_failed": set(),
 }
 
-TERMINAL_STATUSES = frozenset(
-    {"rolled_back", "rollback_failed"}
-)
+TERMINAL_STATUSES = frozenset({"rolled_back", "rollback_failed"})
 
 MAX_RETRIES = 10
 
@@ -68,33 +65,15 @@ class DeploymentAudit(AuditBase):
 
     __tablename__ = "model_deployment_audit"
 
-    id: Mapped[int] = mapped_column(
-        Integer, primary_key=True, autoincrement=True
-    )
-    github_run_id: Mapped[int] = mapped_column(
-        BigInteger, nullable=False
-    )
-    model_version: Mapped[str] = mapped_column(
-        String(64), nullable=False
-    )
-    previous_version: Mapped[str] = mapped_column(
-        String(64), nullable=False
-    )
-    training_commit: Mapped[str] = mapped_column(
-        String(40), nullable=False
-    )
-    quality_gate_run_id: Mapped[int] = mapped_column(
-        BigInteger, nullable=False
-    )
-    approved_by: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
-    render_deployment_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
-    status: Mapped[str] = mapped_column(
-        String(32), nullable=False
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    github_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    previous_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_commit: Mapped[str] = mapped_column(String(40), nullable=False)
+    quality_gate_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    render_deployment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -127,19 +106,13 @@ class DeploymentAuditEvent(AuditBase):
 
     __tablename__ = "model_deployment_audit_events"
 
-    id: Mapped[int] = mapped_column(
-        Integer, primary_key=True, autoincrement=True
-    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     audit_id: Mapped[int] = mapped_column(
         ForeignKey("model_deployment_audit.id"),
         nullable=False,
     )
-    status: Mapped[str] = mapped_column(
-        String(32), nullable=False
-    )
-    render_deployment_id: Mapped[str | None] = mapped_column(
-        String(128), nullable=True
-    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    render_deployment_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),
@@ -199,9 +172,7 @@ class DeploymentAuditStore:
         else:
             raise RuntimeError(f"Unsupported audit database: {dialect}")
 
-        statement = statement.on_conflict_do_nothing(
-            index_elements=["github_run_id"]
-        )
+        statement = statement.on_conflict_do_nothing(index_elements=["github_run_id"])
 
         for attempt in range(MAX_RETRIES):
             try:
@@ -251,9 +222,8 @@ class DeploymentAuditStore:
         self._validate_version(model_version)
         self._validate_version(previous_version)
 
-        if (
-            not isinstance(training_commit, str)
-            or not SHA_RE.fullmatch(training_commit)
+        if not isinstance(training_commit, str) or not SHA_RE.fullmatch(
+            training_commit
         ):
             raise ValueError("Invalid training commit")
 
@@ -306,8 +276,7 @@ class DeploymentAuditStore:
 
             if identity != expected:
                 raise ValueError(
-                    "Existing audit has different provenance "
-                    "or reviewer mismatch"
+                    "Existing audit has different provenance or reviewer mismatch"
                 )
 
             return audit.id
@@ -338,33 +307,25 @@ class DeploymentAuditStore:
                 if previous_status == status:
                     latest = session.scalar(
                         select(DeploymentAuditEvent)
-                        .where(
-                            DeploymentAuditEvent.audit_id == audit_id
-                        )
+                        .where(DeploymentAuditEvent.audit_id == audit_id)
                         .order_by(DeploymentAuditEvent.id.desc())
                         .limit(1)
                     )
 
                     if (
                         latest is not None
-                        and latest.render_deployment_id
-                        == render_deployment_id
+                        and latest.render_deployment_id == render_deployment_id
                     ):
                         return audit_id
 
-                    raise ValueError(
-                        "Conflicting duplicate deployment event"
-                    )
+                    raise ValueError("Conflicting duplicate deployment event")
 
                 if previous_status in TERMINAL_STATUSES:
-                    raise ValueError(
-                        "Cannot transition from terminal state"
-                    )
+                    raise ValueError("Cannot transition from terminal state")
 
                 if status not in TRANSITIONS[previous_status]:
                     raise ValueError(
-                        f"Invalid transition: "
-                        f"{previous_status} -> {status}"
+                        f"Invalid transition: {previous_status} -> {status}"
                     )
 
                 if (
@@ -372,9 +333,7 @@ class DeploymentAuditStore:
                     and status == "rollback_started"
                     and not rollback_authorized
                 ):
-                    raise ValueError(
-                        "Rollback requires explicit authorization"
-                    )
+                    raise ValueError("Rollback requires explicit authorization")
 
                 values = {
                     "status": status,
@@ -382,9 +341,7 @@ class DeploymentAuditStore:
                 }
 
                 if status == "deploying":
-                    values["render_deployment_id"] = (
-                        render_deployment_id
-                    )
+                    values["render_deployment_id"] = render_deployment_id
 
                 # Compare-and-swap:
                 # update only if the previously read state
@@ -510,9 +467,7 @@ class DeploymentAuditStore:
                 {
                     "id": event.id,
                     "status": event.status,
-                    "render_deployment_id": (
-                        event.render_deployment_id
-                    ),
+                    "render_deployment_id": (event.render_deployment_id),
                     "timestamp": event.timestamp.isoformat(),
                 }
                 for event in rows
