@@ -1,0 +1,126 @@
+name: MLForge - Promote Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Candidate model release (e.g. v0.3.1)"
+        required: true
+        type: string
+      evidence_run_id:
+        description: "Successful quality-gate workflow run ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: mlforge-production-promotion
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate model release and evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    outputs:
+      model_version: ${{ steps.version.outputs.value }}
+
+    steps:
+      - name: Validate model version
+        id: version
+        env:
+          MODEL_VERSION: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid model version: $MODEL_VERSION"
+            exit 1
+          fi
+
+          echo "value=$MODEL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify model release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_VERSION: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          gh release view "$MODEL_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' > assets.txt
+
+          for asset in \
+            best_model.joblib \
+            metadata.json \
+            SHA256SUMS.txt
+          do
+            if ! grep -Fxq "$asset" assets.txt; then
+              echo "Missing model artifact: $asset"
+              exit 1
+            fi
+          done
+
+          echo "Required release assets found."
+
+      - name: Validate evaluation workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.evidence_run_id }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "Invalid evaluation run ID"
+            exit 1
+          fi
+
+          RUN_JSON=$(gh run view "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json conclusion,headSha,event,workflowName)
+
+          echo "$RUN_JSON" | jq '{
+            conclusion,
+            headSha,
+            event,
+            workflowName
+          }'
+
+          CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
+
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "Evaluation workflow did not succeed."
+            exit 1
+          fi
+
+          echo "Evaluation workflow completed successfully."
+          echo "Note: Artifact-level quality-gate evidence is not yet verified."
+
+  approve:
+    name: Production model approval
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    environment:
+      name: production
+
+    steps:
+      - name: Confirm approval
+        env:
+          MODEL_VERSION: ${{ needs.validate.outputs.model_version }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "Production environment approval completed."
+          echo "Candidate model: $MODEL_VERSION"
+          echo "Evaluation run: $EVIDENCE_RUN_ID"
+          echo "Approval-only test successful."
+          echo "No Render deployment performed."
