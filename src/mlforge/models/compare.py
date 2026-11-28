@@ -1,4 +1,7 @@
+import hashlib
 import json
+import os
+import re
 from pathlib import Path
 
 import joblib
@@ -14,9 +17,12 @@ EVALUATION_SEED = 2026
 BOOTSTRAP_SAMPLES = 1000
 OUTPUT_DIR = Path("artifacts/promotion")
 
+CHAMPION_DIR = Path("artifacts/champion")
+CANDIDATE_DIR = Path("artifacts/candidate")
+
 
 def evaluate(model, metadata, X, y):
-    """Evaluate a fitted model with its saved threshold."""
+    """Evaluate a fitted model using its saved decision threshold."""
     features = metadata["features"]
     threshold = float(metadata["threshold"])
 
@@ -42,6 +48,7 @@ def load_bundle(directory):
     directory = Path(directory)
 
     model = joblib.load(directory / "best_model.joblib")
+
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
 
     return model, metadata
@@ -60,10 +67,19 @@ def paired_bootstrap(y, champion_prob, candidate_prob):
         raise ValueError("Both classes are required")
 
     rng = np.random.default_rng(EVALUATION_SEED)
-    differences = {"roc_auc": [], "pr_auc": []}
+
+    differences = {
+        "roc_auc": [],
+        "pr_auc": [],
+    }
 
     for _ in range(BOOTSTRAP_SAMPLES):
-        indices = rng.integers(0, len(labels), size=len(labels))
+        indices = rng.integers(
+            0,
+            len(labels),
+            size=len(labels),
+        )
+
         sample_y = labels[indices]
 
         if len(np.unique(sample_y)) < 2:
@@ -77,6 +93,7 @@ def paired_bootstrap(y, champion_prob, candidate_prob):
                 roc_auc_score(sample_y, candidate) - roc_auc_score(sample_y, champion)
             )
         )
+
         differences["pr_auc"].append(
             float(
                 average_precision_score(sample_y, candidate)
@@ -98,10 +115,76 @@ def paired_bootstrap(y, champion_prob, candidate_prob):
     }
 
 
+def sha256_file(path: Path) -> str:
+    """Calculate the SHA-256 digest of an artifact."""
+    with path.open("rb") as source:
+        return hashlib.file_digest(
+            source,
+            "sha256",
+        ).hexdigest()
+
+
+def build_promotion_evidence(
+    *,
+    report: dict,
+    champion_metadata: dict,
+    candidate_metadata: dict,
+) -> dict:
+    """Bind a passed quality gate to the evaluated model artifacts."""
+    training_run_id = os.environ["MLFORGE_CANDIDATE_RUN_ID"]
+    evaluation_run_id = os.environ["GITHUB_RUN_ID"]
+    champion_version = os.environ["MLFORGE_CHAMPION_VERSION"]
+
+    if not training_run_id.isdecimal():
+        raise ValueError("Invalid candidate training run ID")
+
+    if not evaluation_run_id.isdecimal():
+        raise ValueError("Invalid evaluation run ID")
+
+    if not re.fullmatch(
+        r"v[0-9]+\.[0-9]+\.[0-9]+",
+        champion_version,
+    ):
+        raise ValueError("Invalid champion version")
+
+    if report.get("passed") is not True:
+        raise ValueError("Cannot generate positive evidence for a failed quality gate")
+
+    candidate_sha256 = sha256_file(CANDIDATE_DIR / "best_model.joblib")
+
+    champion_sha256 = sha256_file(CHAMPION_DIR / "best_model.joblib")
+
+    return {
+        "schema_version": 1,
+        "candidate": {
+            "model_sha256": candidate_sha256,
+            "training_run_id": int(training_run_id),
+            "training_commit": candidate_metadata["git_commit"],
+            "dataset_sha256": candidate_metadata["dataset_sha256"],
+        },
+        "champion": {
+            "version": champion_version,
+            "model_sha256": champion_sha256,
+            "training_commit": champion_metadata.get("git_commit"),
+        },
+        "evaluation": {
+            "run_id": int(evaluation_run_id),
+            "workflow": "MLForge - Model Quality Gate",
+            "evaluation_status": report["evaluation_status"],
+            "quality_gate_passed": True,
+            "checks": report["checks"],
+            "candidate_metrics": report["candidate"],
+            "champion_metrics": report["champion"],
+            "metric_differences": report["metric_differences"],
+            "paired_bootstrap_95ci": report["paired_bootstrap_95ci"],
+        },
+    }
+
+
 def main():
-    """Evaluate candidate against the saved champion."""
-    champion, champion_meta = load_bundle("artifacts/champion")
-    candidate, candidate_meta = load_bundle("artifacts/candidate")
+    """Evaluate candidate against champion and save audit evidence."""
+    champion, champion_meta = load_bundle(CHAMPION_DIR)
+    candidate, candidate_meta = load_bundle(CANDIDATE_DIR)
 
     X, y = load_dataset()
 
@@ -113,9 +196,18 @@ def main():
         random_state=EVALUATION_SEED,
     )
 
-    champion_metrics, champion_prob = evaluate(champion, champion_meta, X_test, y_test)
+    champion_metrics, champion_prob = evaluate(
+        champion,
+        champion_meta,
+        X_test,
+        y_test,
+    )
+
     candidate_metrics, candidate_prob = evaluate(
-        candidate, candidate_meta, X_test, y_test
+        candidate,
+        candidate_meta,
+        X_test,
+        y_test,
     )
 
     result = check_quality(
@@ -165,17 +257,40 @@ def main():
         "reasons": result.reasons,
     }
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     (OUTPUT_DIR / "quality_report.json").write_text(
-        json.dumps(report, indent=2),
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    # Never retain stale positive evidence from a previous run.
+    evidence_path = OUTPUT_DIR / "promotion_evidence.json"
+    evidence_path.unlink(missing_ok=True)
+
+    if not result.passed:
+        print(json.dumps(report, indent=2), flush=True)
+        raise SystemExit("Candidate failed quality gates")
+
+    evidence = build_promotion_evidence(
+        report=report,
+        champion_metadata=champion_meta,
+        candidate_metadata=candidate_meta,
+    )
+
+    evidence_path.write_text(
+        json.dumps(evidence, indent=2) + "\n",
         encoding="utf-8",
     )
 
     print(json.dumps(report, indent=2), flush=True)
-
-    if not result.passed:
-        raise SystemExit("Candidate failed quality gates")
+    print(
+        "Candidate passed quality gates; promotion evidence generated.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

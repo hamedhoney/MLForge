@@ -127,9 +127,16 @@ jobs:
             --pattern "metadata.json" \
             --pattern "SHA256SUMS.txt"
 
-          test -s artifacts/champion/best_model.joblib
-          test -s artifacts/champion/metadata.json
-          test -s artifacts/champion/SHA256SUMS.txt
+          for filename in \
+            best_model.joblib \
+            metadata.json \
+            SHA256SUMS.txt
+          do
+            test -s "artifacts/champion/$filename" || {
+              echo "::error::Missing champion artifact: $filename"
+              exit 1
+            }
+          done
 
           (
             cd artifacts/champion
@@ -165,7 +172,7 @@ jobs:
             }
           done
 
-          echo "Candidate model artifacts downloaded."
+          echo "Candidate artifacts downloaded."
 
       - name: Verify candidate provenance
         env:
@@ -180,13 +187,16 @@ jobs:
           from pathlib import Path
 
           root = Path("artifacts/candidate")
+
           run_info = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "training_run.json")
               .read_text(encoding="utf-8")
           )
+
           metadata = json.loads(
               (root / "metadata.json").read_text(encoding="utf-8")
           )
+
           provenance = json.loads(
               (root / "provenance.json").read_text(encoding="utf-8")
           )
@@ -206,10 +216,11 @@ jobs:
           if metadata.get("dataset_sha256") != expected_dataset:
               raise SystemExit("Candidate dataset fingerprint mismatch")
 
-          model_path = root / "best_model.joblib"
-          model_hash = hashlib.file_digest(
-              model_path.open("rb"), "sha256"
-          ).hexdigest()
+          with (root / "best_model.joblib").open("rb") as source:
+              model_hash = hashlib.file_digest(
+                  source,
+                  "sha256",
+              ).hexdigest()
 
           print(f"Candidate model SHA-256: {model_hash}")
           print(f"Training commit: {expected_commit}")
@@ -220,18 +231,99 @@ jobs:
           PY
 
       - name: Compare champion and challenger
+        env:
+          MLFORGE_CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          MLFORGE_CHAMPION_VERSION: ${{ inputs.champion_version }}
         run: |
           set -euo pipefail
 
           uv run --locked python -m mlforge.models.compare
 
-      - name: Upload quality-gate report
+          test -s artifacts/promotion/quality_report.json
+          test -s artifacts/promotion/promotion_evidence.json
+
+          echo "Quality gate passed and promotion evidence generated."
+
+      - name: Verify promotion evidence
+        env:
+          RUN_ID: ${{ inputs.candidate_run_id }}
+          CHAMPION_VERSION: ${{ inputs.champion_version }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path(
+              "artifacts/promotion/quality_report.json"
+          )
+          evidence_path = Path(
+              "artifacts/promotion/promotion_evidence.json"
+          )
+
+          report = json.loads(
+              report_path.read_text(encoding="utf-8")
+          )
+          evidence = json.loads(
+              evidence_path.read_text(encoding="utf-8")
+          )
+
+          def sha256(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(
+                      source,
+                      "sha256",
+                  ).hexdigest()
+
+          if report.get("passed") is not True:
+              raise SystemExit("Quality report did not pass")
+
+          evaluation = evidence["evaluation"]
+          candidate = evidence["candidate"]
+          champion = evidence["champion"]
+
+          if evaluation.get("quality_gate_passed") is not True:
+              raise SystemExit("Evidence quality gate did not pass")
+
+          if evaluation.get("run_id") != int(
+              os.environ["GITHUB_RUN_ID"]
+          ):
+              raise SystemExit("Evaluation run ID mismatch")
+
+          if candidate.get("training_run_id") != int(
+              os.environ["RUN_ID"]
+          ):
+              raise SystemExit("Training run ID mismatch")
+
+          if champion.get("version") != os.environ["CHAMPION_VERSION"]:
+              raise SystemExit("Champion version mismatch")
+
+          expected_candidate = sha256(
+              Path("artifacts/candidate/best_model.joblib")
+          )
+          expected_champion = sha256(
+              Path("artifacts/champion/best_model.joblib")
+          )
+
+          if candidate.get("model_sha256") != expected_candidate:
+              raise SystemExit("Candidate model checksum mismatch")
+
+          if champion.get("model_sha256") != expected_champion:
+              raise SystemExit("Champion model checksum mismatch")
+
+          print("Promotion evidence verified successfully")
+          PY
+
+      - name: Upload quality-gate report and evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mlforge-quality-report
           path: artifacts/promotion/
-          retention-days: 30
+          retention-days: 90
           if-no-files-found: warn
 
       - name: Summarize quality-gate execution
@@ -247,10 +339,11 @@ jobs:
             echo "|---|---|"
             echo "| Champion model | $CHAMPION_VERSION |"
             echo "| Candidate training run | $RUN_ID |"
-            echo "| Training provenance | Verified |"
+            echo "| Candidate provenance | Verified |"
             echo "| Champion checksums | Verified against release manifest |"
-            echo "| Comparison command | Completed successfully |"
+            echo "| Quality gate | Passed |"
+            echo "| Promotion evidence | Generated and verified |"
+            echo "| Deployment performed | No |"
             echo ""
-            echo "Artifact-specific promotion evidence is not yet generated."
-            echo "No production deployment was performed."
+            echo "Evidence is available in the mlforge-quality-report artifact."
           } >> "$GITHUB_STEP_SUMMARY"
