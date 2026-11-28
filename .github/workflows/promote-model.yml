@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       model_version:
-        description: "Candidate model release (e.g. v0.3.1)"
+        description: "Published model release to promote"
         required: true
+        default: "v0.4.3"
         type: string
       evidence_run_id:
-        description: "Successful quality-gate workflow run ID"
+        description: "Successful Model Quality Gate run ID"
         required: true
         type: string
 
@@ -22,105 +23,255 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate model release and evaluation
+    name: Verify release and production champion
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     outputs:
-      model_version: ${{ steps.version.outputs.value }}
+      candidate: ${{ steps.verify.outputs.candidate }}
+      champion: ${{ steps.verify.outputs.champion }}
 
     steps:
-      - name: Validate model version
-        id: version
+      - name: Validate inputs
         env:
           MODEL_VERSION: ${{ inputs.model_version }}
-        run: |
-          set -euo pipefail
-
-          if ! [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Invalid model version: $MODEL_VERSION"
-            exit 1
-          fi
-
-          echo "value=$MODEL_VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Verify model release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MODEL_VERSION: ${{ inputs.model_version }}
-        run: |
-          set -euo pipefail
-
-          gh release view "$MODEL_VERSION" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json assets \
-            --jq '.assets[].name' > assets.txt
-
-          for asset in \
-            best_model.joblib \
-            metadata.json \
-            SHA256SUMS.txt
-          do
-            if ! grep -Fxq "$asset" assets.txt; then
-              echo "Missing model artifact: $asset"
-              exit 1
-            fi
-          done
-
-          echo "Required release assets found."
-
-      - name: Validate evaluation workflow run
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.evidence_run_id }}
-        run: |
-          set -euo pipefail
-
-          if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "Invalid evaluation run ID"
-            exit 1
-          fi
-
-          RUN_JSON=$(gh run view "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --json conclusion,headSha,event,workflowName)
-
-          echo "$RUN_JSON" | jq '{
-            conclusion,
-            headSha,
-            event,
-            workflowName
-          }'
-
-          CONCLUSION=$(echo "$RUN_JSON" | jq -r '.conclusion')
-
-          if [ "$CONCLUSION" != "success" ]; then
-            echo "Evaluation workflow did not succeed."
-            exit 1
-          fi
-
-          echo "Evaluation workflow completed successfully."
-          echo "Note: Artifact-level quality-gate evidence is not yet verified."
-
-  approve:
-    name: Production model approval
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    environment:
-      name: production
-
-    steps:
-      - name: Confirm approval
-        env:
-          MODEL_VERSION: ${{ needs.validate.outputs.model_version }}
           EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
         run: |
           set -euo pipefail
 
-          echo "Production environment approval completed."
-          echo "Candidate model: $MODEL_VERSION"
-          echo "Evaluation run: $EVIDENCE_RUN_ID"
-          echo "Approval-only test successful."
+          [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$EVIDENCE_RUN_ID" =~ ^[0-9]+$ ]]
+
+      - name: Download published model evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_VERSION: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          gh release download "$MODEL_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release \
+            --pattern "best_model.joblib" \
+            --pattern "metadata.json" \
+            --pattern "model_manifest.json" \
+            --pattern "promotion_evidence.json" \
+            --pattern "quality_report.json" \
+            --pattern "SHA256SUMS.txt"
+
+          for file in \
+            best_model.joblib \
+            metadata.json \
+            model_manifest.json \
+            promotion_evidence.json \
+            quality_report.json \
+            SHA256SUMS.txt
+          do
+            test -s "release/$file"
+          done
+
+          (
+            cd release
+            sha256sum --check --ignore-missing SHA256SUMS.txt
+          )
+
+      - name: Verify evidence-producing workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        run: |
+          set -euo pipefail
+
+          gh run view "$EVIDENCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json conclusion,headSha,headBranch,event,workflowName \
+            > "$RUNNER_TEMP/evaluation-run.json"
+
+      - name: Inspect Render production model
+        run: |
+          set -euo pipefail
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --max-time 90 \
+            "https://mlforge-api-xhej.onrender.com/health" \
+            -o health.json
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --max-time 90 \
+            "https://mlforge-api-xhej.onrender.com/model/info" \
+            -o production-model.json
+
+      - name: Validate candidate and champion
+        id: verify
+        env:
+          MODEL_VERSION: ${{ inputs.model_version }}
+          EVIDENCE_RUN_ID: ${{ inputs.evidence_run_id }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          def read(path):
+              return json.loads(
+                  Path(path).read_text(encoding="utf-8")
+              )
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(message)
+
+          manifest = read("release/model_manifest.json")
+          evidence = read("release/promotion_evidence.json")
+          report = read("release/quality_report.json")
+          run = read(
+              Path(os.environ["RUNNER_TEMP"])
+              / "evaluation-run.json"
+          )
+          production = read("production-model.json")
+          health = read("health.json")
+
+          candidate = evidence["candidate"]
+          champion = evidence["champion"]
+          evaluation = evidence["evaluation"]
+
+          with Path(
+              "release/best_model.joblib"
+          ).open("rb") as source:
+              digest = hashlib.file_digest(
+                  source, "sha256"
+              ).hexdigest()
+
+          require(
+              manifest["release_version"]
+              == os.environ["MODEL_VERSION"],
+              "Release version mismatch",
+          )
+          require(
+              candidate["model_sha256"] == digest,
+              "Candidate checksum mismatch",
+          )
+          require(
+              manifest["promotion"][
+                  "candidate_model_sha256"
+              ] == digest,
+              "Manifest checksum mismatch",
+          )
+          require(
+              report["passed"] is True,
+              "Quality gate failed",
+          )
+          require(
+              evaluation["quality_gate_passed"] is True,
+              "Evidence gate failed",
+          )
+          require(
+              evaluation["run_id"]
+              == int(os.environ["EVIDENCE_RUN_ID"]),
+              "Evidence run ID mismatch",
+          )
+          require(
+              run["conclusion"] == "success",
+              "Evaluation run unsuccessful",
+          )
+          require(
+              run["workflowName"]
+              == "MLForge - Model Quality Gate",
+              "Unexpected evaluation workflow",
+          )
+          require(
+              run["headBranch"] == "main",
+              "Evaluation did not run on main",
+          )
+          require(
+              run["event"] == "workflow_dispatch",
+              "Unexpected evaluation trigger",
+          )
+          require(
+              run["headSha"]
+              == candidate["training_commit"],
+              "Evaluation commit mismatch",
+          )
+          require(
+              manifest["training_git_commit"]
+              == candidate["training_commit"],
+              "Release commit mismatch",
+          )
+          require(
+              evaluation["checks"] == report["checks"],
+              "Quality checks mismatch",
+          )
+          require(
+              evaluation["candidate_metrics"]
+              == report["candidate"],
+              "Candidate metrics mismatch",
+          )
+          require(
+              evaluation["champion_metrics"]
+              == report["champion"],
+              "Champion metrics mismatch",
+          )
+          require(
+              health["model_loaded"] is True,
+              "Production model unavailable",
+          )
+          require(
+              production["model_version"]
+              == champion["version"],
+              "Production champion has changed",
+          )
+
+          with open(
+              os.environ["GITHUB_OUTPUT"], "a"
+          ) as output:
+              output.write(
+                  f"candidate={os.environ['MODEL_VERSION']}\n"
+              )
+              output.write(
+                  f"champion={champion['version']}\n"
+              )
+
+          print("Candidate release verified")
+          print("Production champion:", champion["version"])
+          print("Candidate:", os.environ["MODEL_VERSION"])
+          PY
+
+      - name: Summarize validation
+        env:
+          CANDIDATE: ${{ steps.verify.outputs.candidate }}
+          CHAMPION: ${{ steps.verify.outputs.champion }}
+        run: |
+          {
+            echo "## MLForge Promotion Validation"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Candidate | $CANDIDATE |"
+            echo "| Champion | $CHAMPION |"
+            echo "| Quality-gate evidence | Verified |"
+            echo "| Production model | Verified |"
+            echo "| Deployment performed | No |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  approve:
+    name: Production approval checkpoint
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 10
+
+    steps:
+      - name: Confirm approved promotion plan
+        env:
+          CANDIDATE: ${{ needs.validate.outputs.candidate }}
+          CHAMPION: ${{ needs.validate.outputs.champion }}
+        run: |
+          echo "Production approval completed."
+          echo "Champion: $CHAMPION"
+          echo "Candidate: $CANDIDATE"
           echo "No Render deployment performed."

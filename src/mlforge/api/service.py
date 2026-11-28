@@ -16,40 +16,59 @@ MODEL_DIR = Path(os.getenv("MLFORGE_MODEL_DIR", "artifacts/tuning"))
 
 
 class ModelService:
-    """Inference wrapper around a verified MLForge model."""
+    """Inference wrapper for a verified, versioned model."""
 
     def __init__(self, model_dir: Path = MODEL_DIR):
         model_dir = Path(model_dir)
 
         model_path = model_dir / "best_model.joblib"
         metadata_path = model_dir / "metadata.json"
+        version_path = model_dir / "version.txt"
 
-        # Download the model when artifacts are missing.
-        if not model_path.is_file() or not metadata_path.is_file():
-            logger.info("Model artifacts missing. Downloading verified release.")
+        requested_version = os.getenv("MLFORGE_MODEL_VERSION")
 
-            # The downloader uses MLFORGE_MODEL_DIR.
-            # Ensure a custom directory stays consistent.
+        cached_version = (
+            version_path.read_text(encoding="utf-8").strip()
+            if version_path.is_file()
+            else None
+        )
+
+        missing = (
+            not model_path.is_file()
+            or not metadata_path.is_file()
+            or not version_path.is_file()
+        )
+
+        version_mismatch = (
+            requested_version is not None and cached_version != requested_version
+        )
+
+        if missing or version_mismatch:
             if model_dir != MODEL_DIR:
                 raise ValueError("Custom model directory requires preloaded artifacts")
 
-            version = download_model()
-
             logger.info(
-                "Downloaded MLForge model version %s",
-                version,
+                "Downloading model: requested=%s cached=%s",
+                requested_version,
+                cached_version,
             )
+            download_model()
 
         if not model_path.is_file():
-            raise FileNotFoundError(f"Model artifact missing: {model_path}")
+            raise FileNotFoundError(model_path)
 
         if not metadata_path.is_file():
-            raise FileNotFoundError(f"Model metadata missing: {metadata_path}")
+            raise FileNotFoundError(metadata_path)
 
-        logger.info("Loading model from %s", model_path)
+        if not version_path.is_file():
+            raise FileNotFoundError(version_path)
 
-        # Only load trusted, verified model artifacts.
-        # joblib deserialization can execute arbitrary code.
+        self.model_version = version_path.read_text(encoding="utf-8").strip()
+
+        if requested_version and self.model_version != requested_version:
+            raise RuntimeError("Loaded model version mismatch")
+
+        # Only deserialize trusted, verified model artifacts.
         self.model = joblib.load(model_path)
 
         self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -61,19 +80,18 @@ class ModelService:
         if not 0 <= self.threshold <= 1:
             raise ValueError("Invalid model threshold")
 
+        if (
+            not isinstance(self.features, list)
+            or not self.features
+            or len(self.features) != len(set(self.features))
+        ):
+            raise ValueError("Invalid feature schema")
+
         if not hasattr(self.model, "predict_proba"):
             raise TypeError("Loaded model does not support predict_proba")
 
-        version_path = model_dir / "version.txt"
-
-        self.model_version = (
-            version_path.read_text(encoding="utf-8").strip()
-            if version_path.is_file()
-            else os.getenv("MLFORGE_MODEL_VERSION", "unknown")
-        )
-
         logger.info(
-            "MLForge model loaded successfully: %s (%s)",
+            "Loaded MLForge model %s (%s)",
             self.model_name,
             self.model_version,
         )
@@ -88,21 +106,20 @@ class ModelService:
 
         records = [customer.model_dump() for customer in customers]
 
-        frame = pd.DataFrame(records)
-        frame = frame.reindex(columns=self.features)
+        frame = pd.DataFrame(records).reindex(columns=self.features)
 
         probabilities = np.asarray(self.model.predict_proba(frame)[:, 1])
 
         results = []
 
-        for probability in probabilities:
-            probability = float(probability)
+        for value in probabilities:
+            probability = float(value)
 
             if not np.isfinite(probability):
-                raise ValueError("Model returned a non-finite probability")
+                raise ValueError("Non-finite model probability")
 
             if not 0 <= probability <= 1:
-                raise ValueError("Model returned an invalid probability")
+                raise ValueError("Invalid model probability")
 
             prediction = int(probability >= self.threshold)
 
