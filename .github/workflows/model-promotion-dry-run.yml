@@ -1,0 +1,117 @@
+name: MLForge - Model Promotion Dry Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Candidate model release"
+        required: true
+        default: "v0.3.1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Validate promotion prerequisites
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Validate model version
+        env:
+          MODEL_VERSION: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$MODEL_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid model version"
+            exit 1
+          fi
+
+      - name: Verify GitHub Release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODEL_VERSION: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          gh release view "$MODEL_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' > assets.txt
+
+          for asset in \
+            best_model.joblib \
+            metadata.json \
+            SHA256SUMS.txt
+          do
+            grep -Fxq "$asset" assets.txt || {
+              echo "Missing artifact: $asset"
+              exit 1
+            }
+          done
+
+          echo "Required model artifacts found."
+
+      - name: Inspect Render deployment configuration
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+
+          test -n "$RENDER_API_KEY"
+          test -n "$RENDER_SERVICE_ID"
+
+          curl --fail-with-body --silent --show-error \
+            --max-time 30 \
+            -H "Authorization: Bearer $RENDER_API_KEY" \
+            "https://api.render.com/v1/services/$RENDER_SERVICE_ID" \
+            -o render-service.json
+
+          jq -r '{
+            id,
+            name,
+            type,
+            serviceDetails: {
+              url: .serviceDetails.url
+            }
+          }' render-service.json
+
+      - name: Verify production model version
+        run: |
+          set -euo pipefail
+
+          curl --fail-with-body --silent --show-error \
+            --max-time 90 \
+            "https://mlforge-api-xhej.onrender.com/model/info" \
+            -o model-info.json
+
+          jq -e '.model_version != null' model-info.json
+
+          echo "Currently deployed model:"
+          jq -r '.model_version' model-info.json
+
+      - name: Summarize dry run
+        env:
+          CANDIDATE: ${{ inputs.model_version }}
+        run: |
+          set -euo pipefail
+
+          CURRENT=$(jq -r '.model_version' model-info.json)
+
+          {
+            echo "## MLForge Model Promotion Dry Run"
+            echo ""
+            echo "| Property | Value |"
+            echo "|---|---|"
+            echo "| Candidate model | $CANDIDATE |"
+            echo "| Current model | $CURRENT |"
+            echo "| Release assets | Verified present |"
+            echo "| Render API access | Verified |"
+            echo "| Deployment performed | No |"
+            echo ""
+            echo "This dry run does not establish quality-gate approval."
+          } >> "$GITHUB_STEP_SUMMARY"
