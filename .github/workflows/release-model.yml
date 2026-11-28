@@ -37,6 +37,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Validate inputs
         env:
@@ -245,12 +248,8 @@ jobs:
           provenance = load(root / "provenance.json")
           intervals = load(root / "confidence_intervals.json")
 
-          report = load(
-              "quality-evidence/quality_report.json"
-          )
-          evidence = load(
-              "quality-evidence/promotion_evidence.json"
-          )
+          report = load("quality-evidence/quality_report.json")
+          evidence = load("quality-evidence/promotion_evidence.json")
 
           candidate = evidence["candidate"]
           champion = evidence["champion"]
@@ -574,11 +573,17 @@ jobs:
           echo "Publishing model $VERSION"
           echo "Training commit: $TRAINING_SHA"
 
-          gh api \
-            --method POST \
-            "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f "ref=refs/tags/$VERSION" \
-            -f "sha=$TRAINING_SHA"
+          git cat-file -e "$TRAINING_SHA^{commit}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag "$VERSION" "$TRAINING_SHA"
+
+          git push origin "refs/tags/$VERSION"
+
+          echo "Model tag created successfully."
 
           gh release create "$VERSION" \
             release/best_model.joblib \
