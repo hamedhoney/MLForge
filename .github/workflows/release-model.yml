@@ -11,6 +11,10 @@ on:
         description: "Successful Model Quality Gate run ID"
         required: true
         type: string
+      version:
+        description: "Existing manually created tag (e.g. v0.4.1)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -26,6 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    permissions:
+      contents: write
+      actions: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,30 +41,112 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Validate run IDs
-        env:
-          TRAINING_RUN_ID: ${{ inputs.training_run_id }}
-          QUALITY_RUN_ID: ${{ inputs.quality_gate_run_id }}
-        run: |
-          set -euo pipefail
-
-          [[ "$TRAINING_RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$QUALITY_RUN_ID" =~ ^[0-9]+$ ]]
-
-      - name: Verify training and quality-gate runs
+      - name: Validate inputs and existing tag
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
           TRAINING_RUN_ID: ${{ inputs.training_run_id }}
           QUALITY_RUN_ID: ${{ inputs.quality_gate_run_id }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          gh run view "$TRAINING_RUN_ID" \
+          [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::Invalid version format"
+            exit 1
+          }
+
+          [[ "$TRAINING_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::Invalid training run ID"
+            exit 1
+          }
+
+          [[ "$QUALITY_RUN_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::Invalid quality-gate run ID"
+            exit 1
+          }
+
+          if gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $VERSION"
+            exit 1
+          fi
+
+          git fetch origin --tags --force
+
+          if ! git show-ref --verify --quiet \
+            "refs/tags/$VERSION"; then
+            echo "::error::Tag does not exist: $VERSION"
+            echo "Create and push the tag manually first."
+            exit 1
+          fi
+
+          TAG_COMMIT=$(git rev-list -n 1 "$VERSION")
+
+          echo "Existing tag: $VERSION"
+          echo "Tag commit: $TAG_COMMIT"
+
+          echo "TAG_COMMIT=$TAG_COMMIT" >> "$GITHUB_ENV"
+
+      - name: Verify training workflow and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.training_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh run view "$RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --json conclusion,headBranch,headSha,workflowName,event \
             > "$RUNNER_TEMP/training_run.json"
 
-          gh run view "$QUALITY_RUN_ID" \
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          info = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "training_run.json")
+              .read_text(encoding="utf-8")
+          )
+
+          expected = {
+              "conclusion": "success",
+              "headBranch": "main",
+              "workflowName": "MLForge - Cloud Training",
+              "event": "workflow_dispatch",
+          }
+
+          for key, value in expected.items():
+              if info.get(key) != value:
+                  raise SystemExit(
+                      f"Invalid training run {key}: {info.get(key)!r}"
+                  )
+
+          commit = info.get("headSha", "")
+
+          if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
+              raise SystemExit("Invalid training commit")
+
+          if commit.lower() != os.environ["TAG_COMMIT"].lower():
+              raise SystemExit(
+                  "Training run commit does not match release tag"
+              )
+
+          print("Training commit verified:", commit)
+          PY
+
+      - name: Verify quality-gate workflow and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.quality_gate_run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh run view "$RUN_ID" \
             --repo "$GITHUB_REPOSITORY" \
             --json conclusion,headBranch,headSha,workflowName,event \
             > "$RUNNER_TEMP/quality_run.json"
@@ -64,154 +154,41 @@ jobs:
           python - <<'PY'
           import json
           import os
-          import re
-          from pathlib import Path
-
-          root = Path(os.environ["RUNNER_TEMP"])
-
-          training = json.loads(
-              (root / "training_run.json").read_text()
-          )
-          quality = json.loads(
-              (root / "quality_run.json").read_text()
-          )
-
-          for info, name in (
-              (training, "MLForge - Cloud Training"),
-              (quality, "MLForge - Model Quality Gate"),
-          ):
-              if info["conclusion"] != "success":
-                  raise SystemExit(f"{name} did not succeed")
-
-              if info["workflowName"] != name:
-                  raise SystemExit("Unexpected workflow identity")
-
-              if info["event"] != "workflow_dispatch":
-                  raise SystemExit("Unexpected workflow trigger")
-
-              if info["headBranch"] != "main":
-                  raise SystemExit("Workflow did not run on main")
-
-          commit = training["headSha"]
-
-          if not re.fullmatch(r"[0-9a-fA-F]{40}", commit):
-              raise SystemExit("Invalid training commit")
-
-          if quality["headSha"] != commit:
-              raise SystemExit(
-                  "Training and quality gate used different commits"
-              )
-
-          print("Verified common commit:", commit)
-          PY
-
-      - name: Resolve existing model tag
-        id: tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          git fetch origin --tags
-
-          TRAINING_SHA=$(python - <<'PY'
-          import json
-          import os
           from pathlib import Path
 
           info = json.loads(
-              (Path(os.environ["RUNNER_TEMP"]) / "training_run.json")
-              .read_text()
-          )
-          print(info["headSha"])
-          PY
+              (Path(os.environ["RUNNER_TEMP"]) / "quality_run.json")
+              .read_text(encoding="utf-8")
           )
 
-          export TRAINING_SHA
+          expected = {
+              "conclusion": "success",
+              "headBranch": "main",
+              "workflowName": "MLForge - Model Quality Gate",
+              "event": "workflow_dispatch",
+          }
 
-          python - <<'PY'
-          import os
-          import re
-          import subprocess
+          for key, value in expected.items():
+              if info.get(key) != value:
+                  raise SystemExit(
+                      f"Invalid quality-gate run {key}: {info.get(key)!r}"
+                  )
 
-          commit = os.environ["TRAINING_SHA"]
-
-          tags = subprocess.check_output(
-              ["git", "tag", "--list"],
-              text=True,
-          ).splitlines()
-
-          matches = []
-
-          for tag in tags:
-              if not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
-                  continue
-
-              resolved = subprocess.check_output(
-                  ["git", "rev-list", "-n", "1", tag],
-                  text=True,
-              ).strip()
-
-              if resolved == commit:
-                  matches.append(tag)
-
-          if len(matches) != 1:
+          if info.get("headSha", "").lower() != os.environ[
+              "TAG_COMMIT"
+          ].lower():
               raise SystemExit(
-                  "Expected exactly one model version tag "
-                  f"for commit {commit}; found: {matches}"
+                  "Quality-gate run commit does not match release tag"
               )
 
-          version = matches[0]
-
-          remote = subprocess.check_output(
-              [
-                  "git",
-                  "ls-remote",
-                  "origin",
-                  f"refs/tags/{version}",
-                  f"refs/tags/{version}^{{}}",
-              ],
-              text=True,
-          )
-
-          refs = dict(
-              (ref, sha)
-              for sha, ref in (
-                  line.split()
-                  for line in remote.splitlines()
-              )
-          )
-
-          tag_ref = f"refs/tags/{version}"
-          peeled_ref = f"{tag_ref}^{{}}"
-
-          if tag_ref not in refs:
-              raise SystemExit("Version tag is not on origin")
-
-          if refs.get(peeled_ref, refs[tag_ref]) != commit:
-              raise SystemExit("Remote tag commit mismatch")
-
-          with open(os.environ["GITHUB_ENV"], "a") as output:
-              output.write(f"MODEL_VERSION={version}\n")
-              output.write(f"TRAINING_SHA={commit}\n")
-              output.write(f"TAG_OBJECT={refs[tag_ref]}\n")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"version={version}\n")
-
-          print("Resolved model version:", version)
+          print("Quality-gate commit verified")
           PY
-
-          if gh release view "$MODEL_VERSION" \
-            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "::error::Release already exists"
-            exit 1
-          fi
 
       - name: Download candidate artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.training_run_id }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -239,6 +216,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ inputs.quality_gate_run_id }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -252,11 +230,12 @@ jobs:
           test -s quality-evidence/quality_report.json
           test -s quality-evidence/promotion_evidence.json
 
-      - name: Verify provenance and promotion evidence
+      - name: Verify model provenance and quality gate
         env:
           TRAINING_RUN_ID: ${{ inputs.training_run_id }}
           QUALITY_RUN_ID: ${{ inputs.quality_gate_run_id }}
           EXPECTED_DATASET_SHA256: "88be4b93fbe0cc83421af1c503794c97c342eca914c1576db7c276e61d61358a"
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -267,6 +246,9 @@ jobs:
           import os
           import re
           from pathlib import Path
+
+          root = Path("release")
+          temp = Path(os.environ["RUNNER_TEMP"])
 
           def load(path):
               return json.loads(
@@ -283,7 +265,8 @@ jobs:
                       source, "sha256"
                   ).hexdigest()
 
-          root = Path("release")
+          training = load(temp / "training_run.json")
+          quality = load(temp / "quality_run.json")
 
           metadata = load(root / "metadata.json")
           metrics = load(root / "metrics.json")
@@ -301,18 +284,27 @@ jobs:
           champion = evidence["champion"]
           evaluation = evidence["evaluation"]
 
-          commit = os.environ["TRAINING_SHA"]
+          commit = os.environ["TAG_COMMIT"]
           dataset_hash = provenance.get("dataset_sha256")
           model_hash = digest(root / "best_model.joblib")
 
+          require(
+              training["headSha"].lower() == commit.lower(),
+              "Training commit mismatch",
+          )
+          require(
+              quality["headSha"].lower() == commit.lower(),
+              "Quality-gate commit mismatch",
+          )
           require(
               provenance.get("git_commit") == commit,
               "Training provenance mismatch",
           )
           require(
               metadata.get("git_commit") == commit,
-              "Metadata commit mismatch",
+              "Metadata provenance mismatch",
           )
+
           require(
               dataset_hash == os.environ["EXPECTED_DATASET_SHA256"],
               "Unexpected dataset fingerprint",
@@ -359,7 +351,6 @@ jobs:
 
           for name in ("roc_auc", "pr_auc"):
               value = float(metrics[name])
-
               require(
                   math.isfinite(value) and 0 <= value <= 1,
                   f"Invalid metric: {name}",
@@ -390,11 +381,11 @@ jobs:
           require(
               candidate.get("training_run_id")
               == int(os.environ["TRAINING_RUN_ID"]),
-              "Training run mismatch",
+              "Candidate training run mismatch",
           )
           require(
               candidate.get("training_commit") == commit,
-              "Candidate commit mismatch",
+              "Candidate training commit mismatch",
           )
           require(
               candidate.get("dataset_sha256") == dataset_hash,
@@ -402,13 +393,13 @@ jobs:
           )
           require(
               candidate.get("model_sha256") == model_hash,
-              "Candidate checksum mismatch",
+              "Candidate model checksum mismatch",
           )
 
           require(
               evaluation.get("run_id")
               == int(os.environ["QUALITY_RUN_ID"]),
-              "Quality-gate run mismatch",
+              "Quality-gate run ID mismatch",
           )
           require(
               evaluation.get("workflow")
@@ -451,15 +442,18 @@ jobs:
               "Invalid champion checksum",
           )
 
-          print("Training provenance verified")
-          print("Quality-gate evidence verified")
+          print("Model provenance and quality gate verified")
+          print("Release commit:", commit)
           print("Candidate SHA-256:", model_hash)
+          print("Champion:", champion["version"])
           PY
 
-      - name: Build release manifest
+      - name: Build immutable release manifest
         env:
+          VERSION: ${{ inputs.version }}
           TRAINING_RUN_ID: ${{ inputs.training_run_id }}
           QUALITY_RUN_ID: ${{ inputs.quality_gate_run_id }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -503,7 +497,7 @@ jobs:
 
           manifest = {
               "schema_version": "1.2",
-              "release_version": os.environ["MODEL_VERSION"],
+              "release_version": os.environ["VERSION"],
               "training_run_id": os.environ["TRAINING_RUN_ID"],
               "quality_gate_run_id": os.environ["QUALITY_RUN_ID"],
               "training_git_commit": provenance["git_commit"],
@@ -564,6 +558,8 @@ jobs:
                   output.write(
                       f"{digest(filename)}  {filename}\n"
                   )
+
+          print("Release manifest generated")
           PY
 
           (
@@ -571,49 +567,49 @@ jobs:
             sha256sum --check SHA256SUMS.txt
           )
 
-      - name: Verify remote tag remains unchanged
+      - name: Verify tag has not changed
+        env:
+          VERSION: ${{ inputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
 
           REMOTE_INFO=$(git ls-remote origin \
-            "refs/tags/$MODEL_VERSION" \
-            "refs/tags/$MODEL_VERSION^{}")
+            "refs/tags/$VERSION" \
+            "refs/tags/$VERSION^{}")
 
-          REMOTE_OBJECT=$(printf '%s\n' "$REMOTE_INFO" |
-            awk -v ref="refs/tags/$MODEL_VERSION" \
+          REMOTE_TAG=$(printf '%s\n' "$REMOTE_INFO" |
+            awk -v ref="refs/tags/$VERSION" \
               '$2 == ref {print $1}')
 
           REMOTE_COMMIT=$(printf '%s\n' "$REMOTE_INFO" |
-            awk -v ref="refs/tags/$MODEL_VERSION^{}" \
+            awk -v ref="refs/tags/$VERSION^{}" \
               '$2 == ref {print $1}')
 
-          test -n "$REMOTE_OBJECT"
+          test -n "$REMOTE_TAG"
 
-          if [ "$REMOTE_OBJECT" != "$TAG_OBJECT" ]; then
-            echo "::error::Tag object changed"
-            exit 1
-          fi
+          RESOLVED="${REMOTE_COMMIT:-$REMOTE_TAG}"
 
-          RESOLVED="${REMOTE_COMMIT:-$REMOTE_OBJECT}"
-
-          if [ "$RESOLVED" != "$TRAINING_SHA" ]; then
-            echo "::error::Tag commit changed"
+          if [ "$RESOLVED" != "$TAG_COMMIT" ]; then
+            echo "::error::Remote tag changed during publication"
             exit 1
           fi
 
       - name: Publish release using existing tag
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          if gh release view "$MODEL_VERSION" \
+          if gh release view "$VERSION" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::Release already exists"
             exit 1
           fi
 
-          gh release create "$MODEL_VERSION" \
+          gh release create "$VERSION" \
             release/best_model.joblib \
             release/metadata.json \
             release/metrics.json \
@@ -625,12 +621,22 @@ jobs:
             release/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
-            --title "MLForge Model $MODEL_VERSION" \
-            --notes "Calibrated model with verified training provenance, champion-challenger quality-gate evidence, evaluation metrics, confidence intervals, and SHA-256 checksums. Production deployment requires separate approval."
+            --title "MLForge Model $VERSION" \
+            --notes "Calibrated MLForge model with verified training provenance, champion-challenger quality-gate evidence, evaluation metrics, confidence intervals, and SHA-256 checksums. Production deployment requires separate approval."
+
+          gh release view "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,url,assets \
+            --jq '{
+              tag: .tagName,
+              url: .url,
+              assets: [.assets[].name]
+            }'
 
       - name: Summarize publication
         if: success()
         env:
+          VERSION: ${{ inputs.version }}
           TRAINING_RUN_ID: ${{ inputs.training_run_id }}
           QUALITY_RUN_ID: ${{ inputs.quality_gate_run_id }}
         run: |
@@ -639,12 +645,14 @@ jobs:
             echo ""
             echo "| Property | Value |"
             echo "|---|---|"
-            echo "| Model version | $MODEL_VERSION |"
+            echo "| Model version | $VERSION |"
             echo "| Training run | $TRAINING_RUN_ID |"
             echo "| Quality-gate run | $QUALITY_RUN_ID |"
-            echo "| Verified commit | $TRAINING_SHA |"
-            echo "| Existing tag | Reused unchanged |"
-            echo "| Quality gate | Passed |"
+            echo "| Training and quality-gate commit | $TAG_COMMIT |"
+            echo "| Training provenance | Verified |"
+            echo "| Quality-gate evidence | Verified |"
+            echo "| Model checksums | Verified |"
+            echo "| Existing Git tag | Reused, unchanged |"
             echo "| GitHub Release | Published |"
             echo "| Render deployment | Not performed |"
           } >> "$GITHUB_STEP_SUMMARY"
