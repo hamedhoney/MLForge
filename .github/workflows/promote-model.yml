@@ -9,7 +9,7 @@ on:
         default: "v0.4.4"
         type: string
       deploy:
-        description: "Deploy after manual production approval"
+        description: "Deploy after mandatory manual approval"
         required: true
         default: false
         type: boolean
@@ -42,7 +42,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Validate input
+      - name: Validate model version
         env:
           MODEL_VERSION: ${{ inputs.model_version }}
         run: |
@@ -55,7 +55,6 @@ jobs:
           MODEL_VERSION: ${{ inputs.model_version }}
         run: |
           set -euo pipefail
-
           mkdir -p release
 
           gh release download "$MODEL_VERSION" \
@@ -81,7 +80,7 @@ jobs:
             sha256sum --check SHA256SUMS.txt
           )
 
-      - name: Verify original workflow evidence
+      - name: Verify original training and quality gate
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -131,7 +130,7 @@ jobs:
             --retry 3 --max-time 90 \
             "$API_URL/model/info" -o production.json
 
-      - name: Verify release and champion
+      - name: Verify promotion eligibility
         id: verify
         env:
           MODEL_VERSION: ${{ inputs.model_version }}
@@ -140,7 +139,6 @@ jobs:
           import hashlib
           import json
           import os
-          import re
           import subprocess
           from pathlib import Path
 
@@ -157,7 +155,7 @@ jobs:
           evidence = load("release/promotion_evidence.json")
           report = load("release/quality_report.json")
           training = load("training-run.json")
-          evaluation_run = load("evaluation-run.json")
+          quality = load("evaluation-run.json")
           health = load("health.json")
           production = load("production.json")
 
@@ -165,20 +163,25 @@ jobs:
           champion = evidence["champion"]
           evaluation = evidence["evaluation"]
 
+          version = os.environ["MODEL_VERSION"]
+          commit = candidate["training_commit"]
+
           with Path("release/best_model.joblib").open("rb") as source:
               digest = hashlib.file_digest(
                   source, "sha256"
               ).hexdigest()
-
-          version = os.environ["MODEL_VERSION"]
-          commit = candidate["training_commit"]
 
           require(
               manifest["release_version"] == version,
               "Release version mismatch",
           )
           require(
-              manifest["file_sha256"]["best_model.joblib"] == digest,
+              manifest["schema_version"] == "1.2",
+              "Unsupported release manifest",
+          )
+          require(
+              manifest["file_sha256"]["best_model.joblib"]
+              == digest,
               "Manifest checksum mismatch",
           )
           require(
@@ -186,7 +189,8 @@ jobs:
               "Candidate checksum mismatch",
           )
           require(
-              manifest["promotion"]["candidate_model_sha256"] == digest,
+              manifest["promotion"]["candidate_model_sha256"]
+              == digest,
               "Promotion checksum mismatch",
           )
           require(
@@ -225,12 +229,12 @@ jobs:
           require(
               manifest["promotion"]["champion_version"]
               == champion["version"],
-              "Champion version mismatch",
+              "Champion evidence mismatch",
           )
 
           for run, name in (
               (training, "MLForge - Cloud Training"),
-              (evaluation_run, "MLForge - Model Quality Gate"),
+              (quality, "MLForge - Model Quality Gate"),
           ):
               require(
                   run["conclusion"] == "success",
@@ -238,7 +242,7 @@ jobs:
               )
               require(
                   run["workflowName"] == name,
-                  f"Unexpected workflow: {name}",
+                  "Unexpected workflow",
               )
               require(
                   run["event"] == "workflow_dispatch",
@@ -273,33 +277,31 @@ jobs:
               "Unexpected evidence workflow",
           )
 
-          require(
-              re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
-              "Invalid training commit",
-          )
-
-          output = subprocess.check_output(
+          refs = subprocess.check_output(
               [
-                  "git", "ls-remote", "origin",
+                  "git",
+                  "ls-remote",
+                  "origin",
                   f"refs/tags/{version}",
                   f"refs/tags/{version}^{{}}",
               ],
               text=True,
-          )
+          ).splitlines()
 
-          refs = {
+          parsed = {
               ref: sha
               for sha, ref in (
                   line.split()
-                  for line in output.splitlines()
+                  for line in refs
               )
           }
 
           tag = f"refs/tags/{version}"
 
-          require(tag in refs, "Release tag missing")
+          require(tag in parsed, "Release tag missing")
           require(
-              refs.get(f"{tag}^{{}}", refs[tag]) == commit,
+              parsed.get(f"{tag}^{{}}", parsed[tag])
+              == commit,
               "Release tag commit mismatch",
           )
 
@@ -337,7 +339,7 @@ jobs:
             echo "|---|---|"
             echo "| Candidate | $CANDIDATE |"
             echo "| Champion | $CHAMPION |"
-            echo "| Evidence | Verified |"
+            echo "| Release evidence | Verified |"
             echo "| Production baseline | Verified |"
             echo "| Deployment requested | $DEPLOY |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -359,13 +361,13 @@ jobs:
       CHAMPION: ${{ needs.validate.outputs.champion }}
 
     steps:
-      - name: Verify credentials
+      - name: Validate credentials
         run: |
           set -euo pipefail
           test -n "$RENDER_API_KEY"
           [[ "$RENDER_SERVICE_ID" =~ ^srv- ]]
 
-      - name: Deploy with verification and rollback
+      - name: Deploy and verify with rollback
         run: |
           python - <<'PY'
           import json
@@ -384,7 +386,20 @@ jobs:
           base = f"https://api.render.com/v1/services/{service}"
           variable = "MLFORGE_MODEL_VERSION"
 
-          def request(url, method="GET", data=None, auth=False):
+          FAILURE_STATUSES = {
+              "build_failed",
+              "update_failed",
+              "canceled",
+              "deactivated",
+              "pre_deploy_failed",
+          }
+
+          def request(
+              url,
+              method="GET",
+              data=None,
+              auth=False,
+          ):
               headers = {"Accept": "application/json"}
 
               if auth:
@@ -408,26 +423,54 @@ jobs:
 
               with urlopen(req, timeout=60) as response:
                   body = response.read()
-                  return json.loads(body) if body else {}
 
-          def configured_version():
-              # Render returns a list of {cursor, envVar} objects.
-              entries = request(
-                  f"{base}/env-vars",
+                  return (
+                      json.loads(body)
+                      if body
+                      else {}
+                  )
+
+          def render_request(
+              path,
+              method="GET",
+              data=None,
+          ):
+              return request(
+                  f"{base}{path}",
+                  method=method,
+                  data=data,
                   auth=True,
               )
 
+          def extract_deploy(payload):
+              if not isinstance(payload, dict):
+                  return None
+
+              if isinstance(payload.get("deploy"), dict):
+                  return payload["deploy"]
+
+              if isinstance(payload.get("deployment"), dict):
+                  return payload["deployment"]
+
+              if isinstance(payload.get("id"), str):
+                  return payload
+
+              return None
+
+          def get_env_version():
+              entries = render_request("/env-vars")
+
               if not isinstance(entries, list):
                   raise RuntimeError(
-                      "Unexpected Render environment response"
+                      "Unexpected environment response"
                   )
 
               matches = [
-                  entry["envVar"]
-                  for entry in entries
-                  if isinstance(entry, dict)
-                  and isinstance(entry.get("envVar"), dict)
-                  and entry["envVar"].get("key") == variable
+                  item["envVar"]
+                  for item in entries
+                  if isinstance(item, dict)
+                  and isinstance(item.get("envVar"), dict)
+                  and item["envVar"].get("key") == variable
               ]
 
               if len(matches) != 1:
@@ -437,21 +480,25 @@ jobs:
 
               return matches[0].get("value")
 
-          def set_version(version):
-              request(
-                  f"{base}/env-vars/{quote(variable, safe='')}",
+          def set_env_version(version):
+              render_request(
+                  f"/env-vars/{quote(variable, safe='')}",
                   method="PUT",
                   data={"value": version},
-                  auth=True,
               )
 
-              # Read back configuration instead of trusting PUT alone.
-              actual = configured_version()
+              actual = get_env_version()
 
               if actual != version:
                   raise RuntimeError(
-                      "Render configuration update not verified"
+                      "Render environment update not verified"
                   )
+
+              print(
+                  "Configured model version:",
+                  actual,
+                  flush=True,
+              )
 
           def running_version():
               health = request(f"{api}/health")
@@ -461,68 +508,77 @@ jobs:
                   health.get("status") != "ready"
                   or health.get("model_loaded") is not True
               ):
-                  raise RuntimeError("Production API unavailable")
+                  raise RuntimeError("API not ready")
 
               return info.get("model_version")
 
-          def trigger_deploy():
-              result = request(
-                  f"{base}/deploys",
-                  method="POST",
-                  data={"clearCache": "do_not_clear"},
-                  auth=True,
+          def latest_deploy():
+              result = render_request(
+                  "/deploys?limit=1"
               )
 
-              deploy_id = result.get("id")
+              if not isinstance(result, list) or not result:
+                  return None
 
-              if not deploy_id:
-                  raise RuntimeError("Missing Render deployment ID")
+              return extract_deploy(result[0])
 
-              return deploy_id
+          def deploy_status(deploy_id):
+              result = render_request(
+                  f"/deploys/{quote(deploy_id, safe='')}"
+              )
+
+              deploy = extract_deploy(result)
+
+              if deploy is None:
+                  raise RuntimeError(
+                      "Unexpected deployment status response"
+                  )
+
+              return deploy.get("status", "")
 
           def wait_for_deploy(deploy_id, timeout=900):
               deadline = time.monotonic() + timeout
 
               while time.monotonic() < deadline:
-                  result = request(
-                      f"{base}/deploys/{deploy_id}",
-                      auth=True,
-                  )
+                  status = deploy_status(deploy_id)
 
-                  status = result.get("status")
-                  print("Deployment status:", status, flush=True)
+                  print(
+                      "Render deployment:",
+                      deploy_id,
+                      "status:",
+                      status,
+                      flush=True,
+                  )
 
                   if status == "live":
                       return
 
-                  if status in {
-                      "build_failed",
-                      "update_failed",
-                      "canceled",
-                      "deactivated",
-                  }:
+                  if status in FAILURE_STATUSES:
                       raise RuntimeError(
                           f"Render deployment failed: {status}"
                       )
 
                   time.sleep(15)
 
-              raise TimeoutError("Render deployment timed out")
+              raise TimeoutError(
+                  "Render deployment timed out"
+              )
 
-          def wait_for_model(expected, timeout=240):
+          def wait_for_model(version, timeout=300):
               deadline = time.monotonic() + timeout
 
               while time.monotonic() < deadline:
                   try:
                       actual = running_version()
 
-                      if actual == expected:
+                      if actual == version:
                           return
 
                       print(
-                          f"Expected {expected}, observed {actual}",
+                          f"Waiting for {version}; observed {actual}",
                           flush=True,
                       )
+
                   except (
                       HTTPError,
                       URLError,
@@ -536,46 +592,135 @@ jobs:
                   time.sleep(10)
 
               raise TimeoutError(
-                  f"Model {expected} not verified"
+                  f"Model {version} not verified"
               )
 
-          # Recheck after GitHub environment approval.
-          current = configured_version()
+          def request_deployment():
+              result = render_request(
+                  "/deploys",
+                  method="POST",
+                  data={"clearCache": "do_not_clear"},
+              )
 
-          if current != champion:
+              deploy = extract_deploy(result)
+
+              if deploy and deploy.get("id"):
+                  return deploy["id"]
+
+              print(
+                  "Render deployment response keys:",
+                  sorted(result)
+                  if isinstance(result, dict)
+                  else type(result).__name__,
+                  flush=True,
+              )
+
+              # The request may have been accepted even if its
+              # response did not contain an expected ID.
+              # Never guess that an unrelated deployment is ours.
+              raise RuntimeError(
+                  "Deployment request returned no identifiable ID"
+              )
+
+          def wait_for_change(previous_id, timeout=120):
+              deadline = time.monotonic() + timeout
+
+              while time.monotonic() < deadline:
+                  deploy = latest_deploy()
+
+                  if deploy:
+                      deploy_id = deploy.get("id")
+
+                      if deploy_id and deploy_id != previous_id:
+                          print(
+                              "Detected new Render deployment:",
+                              deploy_id,
+                              flush=True,
+                          )
+                          return deploy_id
+
+                  time.sleep(10)
+
+              return None
+
+          def deploy_version(version):
+              previous = latest_deploy()
+              previous_id = (
+                  previous.get("id")
+                  if previous
+                  else None
+              )
+
+              set_env_version(version)
+
+              # Render may automatically deploy after env updates.
+              deploy_id = wait_for_change(
+                  previous_id,
+                  timeout=60,
+              )
+
+              if deploy_id is None:
+                  print(
+                      "No automatic deployment detected.",
+                      flush=True,
+                  )
+                  deploy_id = request_deployment()
+
+              wait_for_deploy(deploy_id)
+              wait_for_model(version)
+
+              if get_env_version() != version:
+                  raise RuntimeError(
+                      "Final configuration mismatch"
+                  )
+
+              if running_version() != version:
+                  raise RuntimeError(
+                      "Final running model mismatch"
+                  )
+
+              return deploy_id
+
+          # Recheck production after manual approval.
+          configured = get_env_version()
+          running = running_version()
+
+          if configured != champion:
               raise SystemExit(
                   "Configured champion changed after approval"
               )
 
-          if running_version() != champion:
+          if running != champion:
               raise SystemExit(
                   "Running champion changed after approval"
               )
 
-          print("Current champion:", champion, flush=True)
-          print("Candidate:", candidate, flush=True)
+          print(
+              "Current champion:",
+              champion,
+              flush=True,
+          )
+          print(
+              "Candidate:",
+              candidate,
+              flush=True,
+          )
 
           mutation_attempted = False
 
           try:
-              # Begin production mutation.
               mutation_attempted = True
-              set_version(candidate)
 
-              deploy_id = trigger_deploy()
-              print("Candidate deployment:", deploy_id, flush=True)
-
-              wait_for_deploy(deploy_id)
-              wait_for_model(candidate)
-
-              if configured_version() != candidate:
-                  raise RuntimeError(
-                      "Final Render configuration mismatch"
-                  )
+              deploy_id = deploy_version(candidate)
 
               print(
                   "SUCCESS: production model verified:",
                   candidate,
+                  flush=True,
+              )
+              print(
+                  "Verified deployment ID:",
+                  deploy_id,
                   flush=True,
               )
 
@@ -583,8 +728,6 @@ jobs:
               print(
                   "Promotion failed:",
                   type(error).__name__,
-                  str(error) if not isinstance(error, HTTPError)
-                  else f"HTTP {error.code}",
                   flush=True,
               )
 
@@ -596,26 +739,18 @@ jobs:
                   )
 
                   try:
-                      set_version(champion)
-
-                      rollback_id = trigger_deploy()
-                      print(
-                          "Rollback deployment:",
-                          rollback_id,
-                          flush=True,
+                      rollback_id = deploy_version(
+                          champion
                       )
-
-                      wait_for_deploy(rollback_id)
-                      wait_for_model(champion)
-
-                      if configured_version() != champion:
-                          raise RuntimeError(
-                              "Rollback configuration mismatch"
-                          )
 
                       print(
                           "Rollback verified:",
                           champion,
+                          flush=True,
+                      )
+                      print(
+                          "Rollback deployment:",
+                          rollback_id,
                           flush=True,
                       )
 
@@ -646,7 +781,6 @@ jobs:
             echo "| New production model | $CANDIDATE |"
             echo "| Manual approval | Required |"
             echo "| Render configuration | Verified |"
-            echo "| Deployment | Successful |"
             echo "| Running model | Verified |"
             echo "| Rollback | Not required |"
           } >> "$GITHUB_STEP_SUMMARY"
